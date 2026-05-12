@@ -24,9 +24,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '/status - collector and dataset status\n'
         '/summary - pattern summary by mode\n'
         '/paper - paper simulation summary\n'
+        '/sweep - top optimized parameter sets\n'
         '/latest - latest saved trajectories\n'
         '/export - export finished trajectories CSV\n'
-        '/export_features - export analysis features CSV'
+        '/export_features - export analysis features CSV\n'
+        '/export_sweep - export sweep results CSV'
     )
 
 
@@ -55,14 +57,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute('SELECT COUNT(*) FROM virtual_trades')
         paper = cur.fetchone()[0]
 
+    sweep_count = 0
+    if table_exists(cur, 'strategy_sweep'):
+        cur.execute('SELECT COUNT(*) FROM strategy_sweep')
+        sweep_count = cur.fetchone()[0]
+
     text = (
         'Status\n\n'
         f'Finished trajectories: {finished}\n'
         f'Live snapshots: {snapshots}\n'
         f'Analysis rows: {features}\n'
         f'Paper simulation trades: {paper}\n'
+        f'Sweep rows: {sweep_count}\n'
         f'Last snapshot: {last_snapshot}\n\n'
-        'If finished trajectories are not growing, the collector is probably waiting for new expired tokens.'
+        'Run order: collector -> finished collector -> analyze.py -> paper_sim.py -> sweep.py'
     )
     await update.message.reply_text(text)
 
@@ -119,7 +127,7 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         table = 'virtual_trades'
 
     if not table:
-        await update.message.reply_text('No paper simulation table yet. Run the paper/backtest script after analyze.py.')
+        await update.message.reply_text('No paper simulation table yet. Run: python paper_sim.py')
         return
 
     cur.execute(f'''
@@ -133,7 +141,8 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         MAX(pnl_pct) AS best
     FROM {table}
     GROUP BY strategy, COALESCE(mode, 'UNKNOWN')
-    ORDER BY strategy, n DESC
+    ORDER BY avg_pnl DESC
+    LIMIT 20
     ''')
     rows = cur.fetchall()
 
@@ -147,6 +156,45 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'{r[0]} / {r[1]} | n={r[2]}\n'
             f'avg pnl: {r[3]:.2f}% | winrate: {r[4]*100:.1f}%\n'
             f'worst: {r[5]:.2f}% | best: {r[6]:.2f}%\n\n'
+        )
+
+    await update.message.reply_text(text[:4000])
+
+
+async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+
+    if not table_exists(cur, 'strategy_sweep'):
+        await update.message.reply_text('No sweep results yet. Run: python sweep.py')
+        return
+
+    min_trades = 10
+    if context.args:
+        try:
+            min_trades = int(context.args[0])
+        except Exception:
+            min_trades = 10
+
+    cur.execute('''
+    SELECT mode, side, strategy, trades, winrate, avg_pnl, median_pnl, worst_pnl, best_pnl
+    FROM strategy_sweep
+    WHERE trades >= %s
+    ORDER BY avg_pnl DESC
+    LIMIT 15
+    ''', (min_trades,))
+    rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text(f'No sweep rows with trades >= {min_trades}.')
+        return
+
+    text = f'Top sweep results, min trades={min_trades}\n\n'
+    for r in rows:
+        text += (
+            f'{r[0]} {r[1]}\n'
+            f'{r[2]} | n={r[3]}\n'
+            f'avg: {r[5]:.2f}% | median: {r[6]:.2f}% | win: {r[4]*100:.1f}%\n'
+            f'worst: {r[7]:.2f}% | best: {r[8]:.2f}%\n\n'
         )
 
     await update.message.reply_text(text[:4000])
@@ -221,13 +269,44 @@ async def export_features(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=data, filename='trajectory_features.csv')
 
 
+async def export_sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+
+    if not table_exists(cur, 'strategy_sweep'):
+        await update.message.reply_text('No sweep results yet. Run: python sweep.py')
+        return
+
+    cur.execute('''
+    SELECT mode, side, strategy, entry_threshold, take_profit, stop_loss, trades,
+           winrate, avg_pnl, median_pnl, worst_pnl, best_pnl, expectancy
+    FROM strategy_sweep
+    ORDER BY avg_pnl DESC
+    LIMIT 5000
+    ''')
+    rows = cur.fetchall()
+
+    csv_bytes = io.StringIO()
+    writer = csv.writer(csv_bytes)
+    writer.writerow([
+        'mode', 'side', 'strategy', 'entry_threshold', 'take_profit', 'stop_loss', 'trades',
+        'winrate', 'avg_pnl', 'median_pnl', 'worst_pnl', 'best_pnl', 'expectancy'
+    ])
+    writer.writerows(rows)
+
+    data = io.BytesIO(csv_bytes.getvalue().encode('utf-8'))
+    data.seek(0)
+    await update.message.reply_document(document=data, filename='strategy_sweep.csv')
+
+
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler('start', start))
 app.add_handler(CommandHandler('status', status))
 app.add_handler(CommandHandler('stats', status))
 app.add_handler(CommandHandler('summary', summary))
 app.add_handler(CommandHandler('paper', paper))
+app.add_handler(CommandHandler('sweep', sweep))
 app.add_handler(CommandHandler('latest', latest))
 app.add_handler(CommandHandler('export', export))
 app.add_handler(CommandHandler('export_features', export_features))
+app.add_handler(CommandHandler('export_sweep', export_sweep))
 app.run_polling()
