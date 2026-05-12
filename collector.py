@@ -2,16 +2,21 @@ import json
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 
-import psycopg2
+import psycopg
+from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+
+load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 START_URL = os.getenv("START_URL", "https://catapult.trade/turbo/discover")
 DEBUG_EVERY_SECONDS = int(os.getenv("DEBUG_EVERY_SECONDS", "120"))
-PAGE_RECREATE_SECONDS = int(os.getenv("PAGE_RECREATE_SECONDS", "600"))
+LOCAL_PROFILE_DIR = os.getenv("LOCAL_PROFILE_DIR", "browser_profile")
+HEADLESS = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes", "on")
 
-conn = psycopg2.connect(DATABASE_URL)
+conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 cur = conn.cursor()
 
@@ -92,7 +97,7 @@ def log_debug(event, page=None, body_preview=None, screenshot=None):
         INSERT INTO collector_debug(ts, event, url, title, body_preview, screenshot)
         VALUES (%s, %s, %s, %s, %s, %s)
         """,
-        (datetime.utcnow(), event, url, title, body_preview, psycopg2.Binary(screenshot) if screenshot else None)
+        (datetime.utcnow(), event, url, title, body_preview, screenshot)
     )
 
     print(f"debug: {event} | url={url} | title={title}", flush=True)
@@ -109,7 +114,7 @@ def recursive_extract(obj):
     results = []
 
     if isinstance(obj, dict):
-        if 'id' in obj and ('price' in str(obj).lower() or 'mode' in obj):
+        if 'id' in obj and ('price' in str(obj).lower() or 'mode' in obj or 'speedMode' in obj):
             results.append(obj)
 
         for v in obj.values():
@@ -141,11 +146,11 @@ def save_snapshots(items):
             continue
 
         price = item.get('currentPrice') or item.get('price') or item.get('markPrice')
-        volume = item.get('volume')
-        buys = item.get('buys')
-        sells = item.get('sells')
-        traders = item.get('traders')
-        mode = item.get('mode')
+        volume = item.get('volume') or item.get('volumeUsdtDrops')
+        buys = item.get('buys') or item.get('buysCount')
+        sells = item.get('sells') or item.get('sellsCount')
+        traders = item.get('traders') or item.get('uniqueTradersCount')
+        mode = item.get('mode') or item.get('speedMode')
 
         cur.execute(
             '''
@@ -212,10 +217,17 @@ def attach_handlers(page):
             print(f"graphql response parse skipped: {exc}", flush=True)
             return
 
-        operation = None
-        if isinstance(data, dict):
-            operation = data.get('operationName')
+        if isinstance(data, list):
+            for entry in data:
+                save_graphql(None, entry)
+                extracted = recursive_extract(entry)
+                if extracted:
+                    save_snapshots(extracted)
+                try_save_finished(entry)
+            print("graphql captured batch", flush=True)
+            return
 
+        operation = data.get('operationName') if isinstance(data, dict) else None
         save_graphql(operation, data)
         extracted = recursive_extract(data)
 
@@ -228,67 +240,32 @@ def attach_handlers(page):
     page.on('response', on_response)
 
 
-def new_page(context):
-    page = context.new_page()
-    attach_handlers(page)
-    page.goto(START_URL, wait_until='domcontentloaded', timeout=60000)
-    page.wait_for_timeout(12000)
-    log_debug('page_created', page=page)
-    return page
-
-
 print(f"collector boot: START_URL={START_URL}", flush=True)
+print(f"profile dir: {Path(LOCAL_PROFILE_DIR).resolve()}", flush=True)
+print(f"headless: {HEADLESS}", flush=True)
 
 with sync_playwright() as p:
-    browser = p.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-        ],
-    )
-
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
+    context = p.chromium.launch_persistent_context(
+        user_data_dir=LOCAL_PROFILE_DIR,
+        headless=HEADLESS,
         viewport={"width": 1365, "height": 768},
         locale="en-US",
+        args=["--disable-blink-features=AutomationControlled"],
     )
 
-    page = None
-    page_created_at = 0
+    page = context.pages[0] if context.pages else context.new_page()
+    attach_handlers(page)
+
+    page.goto(START_URL, wait_until='domcontentloaded', timeout=60000)
+
+    print("Browser opened. If Cloudflare appears, solve it manually in the opened window.", flush=True)
+    print("Leave this command window running.", flush=True)
+
     last_debug = 0
 
     while True:
         try:
-            now = time.time()
-
-            if page is None or page.is_closed() or now - page_created_at > PAGE_RECREATE_SECONDS:
-                try:
-                    if page and not page.is_closed():
-                        page.close()
-                except Exception:
-                    pass
-
-                page = new_page(context)
-                page_created_at = now
-                last_debug = now
-
-            title = ""
-            try:
-                title = page.title()
-            except Exception:
-                title = "page-title-error"
-
-            if "Just a moment" in title:
-                log_debug('cloudflare_wait', page=page)
-                page.wait_for_timeout(30000)
-            else:
-                page.wait_for_timeout(30000)
+            page.wait_for_timeout(30000)
 
             now = time.time()
             if now - last_debug >= DEBUG_EVERY_SECONDS:
@@ -298,10 +275,4 @@ with sync_playwright() as p:
         except Exception as exc:
             log_debug('page_loop_error', body_preview=str(exc))
             print(f"page loop error: {exc}", flush=True)
-            try:
-                if page and not page.is_closed():
-                    page.close()
-            except Exception:
-                pass
-            page = None
             time.sleep(10)
