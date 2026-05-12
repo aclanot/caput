@@ -7,6 +7,8 @@ import psycopg2
 import requests
 
 DATABASE_URL = os.getenv('DATABASE_URL')
+CATAPULT_COOKIE = os.getenv('CATAPULT_COOKIE', '').strip()
+CF_CLEARANCE = os.getenv('CF_CLEARANCE', '').strip()
 
 conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
@@ -44,16 +46,15 @@ query TurboTokenList($pagination: CursorPaginationInput!, $filter: TurboTokenLis
 PAYLOAD = {
     'operationName': 'TurboTokenList',
     'variables': {
-        'pagination': {
-            'limit': 40
-        },
-        'filter': {}
+        'pagination': {'limit': 40},
+        'filter': {},
     },
     'query': QUERY,
 }
 
 HEADERS = {
     'accept': '*/*',
+    'accept-language': 'en-US,en;q=0.9',
     'content-type': 'application/json',
     'origin': 'https://catapult.trade',
     'referer': 'https://catapult.trade/turbo/discover',
@@ -63,6 +64,11 @@ HEADERS = {
         'Chrome/125.0.0.0 Safari/537.36'
     ),
 }
+
+if CATAPULT_COOKIE:
+    HEADERS['cookie'] = CATAPULT_COOKIE
+elif CF_CLEARANCE:
+    HEADERS['cookie'] = f'cf_clearance={CF_CLEARANCE}'
 
 cur.execute('''
 CREATE TABLE IF NOT EXISTS graphql_raw (
@@ -125,34 +131,23 @@ def save_items(items):
 
 
 print('direct graphql collector started', flush=True)
+print(f'cookie configured: {bool(HEADERS.get("cookie"))}', flush=True)
 
 while True:
     try:
-        r = session.post(
-            GRAPHQL_URL,
-            json=PAYLOAD,
-            headers=HEADERS,
-            timeout=30,
-        )
+        r = session.post(GRAPHQL_URL, json=PAYLOAD, headers=HEADERS, timeout=30)
 
         print(f'status={r.status_code}', flush=True)
 
         if r.status_code != 200:
             print(r.text[:500], flush=True)
-            time.sleep(15)
+            time.sleep(20)
             continue
 
         data = r.json()
-
         save_raw(data)
 
-        items = (
-            data
-            .get('data', {})
-            .get('turboTokenList', {})
-            .get('items', [])
-        )
-
+        items = data.get('data', {}).get('turboTokenList', {}).get('items', [])
         saved = save_items(items)
 
         print(f'direct snapshots saved: {saved}', flush=True)
