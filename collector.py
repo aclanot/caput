@@ -8,7 +8,8 @@ from playwright.sync_api import sync_playwright
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 START_URL = os.getenv("START_URL", "https://catapult.trade/turbo/discover")
-DEBUG_EVERY_SECONDS = int(os.getenv("DEBUG_EVERY_SECONDS", "60"))
+DEBUG_EVERY_SECONDS = int(os.getenv("DEBUG_EVERY_SECONDS", "120"))
+PAGE_RECREATE_SECONDS = int(os.getenv("PAGE_RECREATE_SECONDS", "600"))
 
 conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
@@ -200,6 +201,42 @@ def try_save_finished(data):
     walk(data)
 
 
+def attach_handlers(page):
+    def on_response(response):
+        if '/graphql' not in response.url:
+            return
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            print(f"graphql response parse skipped: {exc}", flush=True)
+            return
+
+        operation = None
+        if isinstance(data, dict):
+            operation = data.get('operationName')
+
+        save_graphql(operation, data)
+        extracted = recursive_extract(data)
+
+        if extracted:
+            save_snapshots(extracted)
+
+        try_save_finished(data)
+        print(f"graphql captured operation={operation}", flush=True)
+
+    page.on('response', on_response)
+
+
+def new_page(context):
+    page = context.new_page()
+    attach_handlers(page)
+    page.goto(START_URL, wait_until='domcontentloaded', timeout=60000)
+    page.wait_for_timeout(12000)
+    log_debug('page_created', page=page)
+    return page
+
+
 print(f"collector boot: START_URL={START_URL}", flush=True)
 
 with sync_playwright() as p:
@@ -222,55 +259,49 @@ with sync_playwright() as p:
         locale="en-US",
     )
 
-    page = context.new_page()
-
-    def on_response(response):
-        if '/graphql' not in response.url:
-            return
-
-        try:
-            data = response.json()
-        except Exception as exc:
-            print(f"graphql response parse failed: {exc}", flush=True)
-            return
-
-        operation = None
-        if isinstance(data, dict):
-            operation = data.get('operationName')
-
-        save_graphql(operation, data)
-        extracted = recursive_extract(data)
-
-        if extracted:
-            save_snapshots(extracted)
-
-        try_save_finished(data)
-        print(f"graphql captured operation={operation}", flush=True)
-
-    page.on('response', on_response)
-
-    try:
-        page.goto(START_URL, wait_until='domcontentloaded', timeout=60000)
-        page.wait_for_timeout(10000)
-        log_debug('initial_load', page=page)
-    except Exception as exc:
-        log_debug('initial_load_failed', body_preview=str(exc))
-        print(f"initial load failed: {exc}", flush=True)
-
+    page = None
+    page_created_at = 0
     last_debug = 0
 
     while True:
         try:
-            page.reload(wait_until='domcontentloaded', timeout=60000)
-            page.wait_for_timeout(8000)
+            now = time.time()
+
+            if page is None or page.is_closed() or now - page_created_at > PAGE_RECREATE_SECONDS:
+                try:
+                    if page and not page.is_closed():
+                        page.close()
+                except Exception:
+                    pass
+
+                page = new_page(context)
+                page_created_at = now
+                last_debug = now
+
+            title = ""
+            try:
+                title = page.title()
+            except Exception:
+                title = "page-title-error"
+
+            if "Just a moment" in title:
+                log_debug('cloudflare_wait', page=page)
+                page.wait_for_timeout(30000)
+            else:
+                page.wait_for_timeout(30000)
 
             now = time.time()
             if now - last_debug >= DEBUG_EVERY_SECONDS:
-                log_debug('periodic_reload', page=page)
+                log_debug('heartbeat', page=page)
                 last_debug = now
 
         except Exception as exc:
-            log_debug('reload_failed', body_preview=str(exc))
-            print(f"reload failed: {exc}", flush=True)
-
-        time.sleep(15)
+            log_debug('page_loop_error', body_preview=str(exc))
+            print(f"page loop error: {exc}", flush=True)
+            try:
+                if page and not page.is_closed():
+                    page.close()
+            except Exception:
+                pass
+            page = None
+            time.sleep(10)
