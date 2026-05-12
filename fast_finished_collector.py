@@ -16,6 +16,8 @@ HEADLESS = os.getenv('HEADLESS', 'false').lower() in ('1', 'true', 'yes', 'on')
 START_URL = os.getenv('START_URL', 'https://catapult.trade/turbo/discover')
 REQUEST_INTERVAL_SECONDS = float(os.getenv('FAST_FINISHED_INTERVAL_SECONDS', '0.15'))
 BATCH_LIMIT = int(os.getenv('FAST_FINISHED_BATCH_LIMIT', '200'))
+NOT_READY_COOLDOWN_MINUTES = int(os.getenv('NOT_READY_COOLDOWN_MINUTES', '30'))
+NOT_READY_MAX_RETRIES = int(os.getenv('NOT_READY_MAX_RETRIES', '8'))
 
 FAIR_QUERY = '''
 query TurboTokenFairData($tokenId: String!) {
@@ -68,6 +70,11 @@ CREATE TABLE IF NOT EXISTS fast_finished_scan_log (
 )
 ''')
 
+cur.execute('''
+CREATE INDEX IF NOT EXISTS idx_fast_finished_scan_log_token_status_ts
+ON fast_finished_scan_log(token_id, status, ts)
+''')
+
 
 def log_scan(token_id, status, note=''):
     cur.execute(
@@ -79,18 +86,43 @@ def log_scan(token_id, status, note=''):
 
 def get_candidate_tokens():
     cur.execute('''
-    SELECT token_id
-    FROM (
+    WITH candidates AS (
         SELECT token_id, MAX(token_id::BIGINT) AS token_num
         FROM token_snapshots
         WHERE token_id IS NOT NULL
           AND token_id ~ '^[0-9]+$'
           AND token_id NOT IN (SELECT token_id FROM finished_tokens)
         GROUP BY token_id
-    ) t
-    ORDER BY token_num DESC
+    ), retry_state AS (
+        SELECT
+            token_id,
+            COUNT(*) FILTER (WHERE status IN ('not_ready', 'no_fair_data')) AS not_ready_count,
+            MAX(ts) FILTER (WHERE status IN ('not_ready', 'no_fair_data')) AS last_not_ready_ts,
+            COUNT(*) FILTER (WHERE status LIKE 'http_%' OR status = 'error') AS error_count,
+            MAX(ts) FILTER (WHERE status LIKE 'http_%' OR status = 'error') AS last_error_ts
+        FROM fast_finished_scan_log
+        GROUP BY token_id
+    )
+    SELECT c.token_id
+    FROM candidates c
+    LEFT JOIN retry_state r ON r.token_id = c.token_id
+    WHERE NOT (
+        COALESCE(r.not_ready_count, 0) >= %s
+        AND COALESCE(r.last_not_ready_ts, TIMESTAMP '1970-01-01') > NOW() - (%s || ' minutes')::interval
+    )
+    AND NOT (
+        COALESCE(r.error_count, 0) >= %s
+        AND COALESCE(r.last_error_ts, TIMESTAMP '1970-01-01') > NOW() - (%s || ' minutes')::interval
+    )
+    ORDER BY c.token_num DESC
     LIMIT %s
-    ''', (BATCH_LIMIT,))
+    ''', (
+        NOT_READY_MAX_RETRIES,
+        NOT_READY_COOLDOWN_MINUTES,
+        NOT_READY_MAX_RETRIES,
+        NOT_READY_COOLDOWN_MINUTES,
+        BATCH_LIMIT,
+    ))
     return [row[0] for row in cur.fetchall()]
 
 
@@ -143,9 +175,30 @@ def fetch_fair_data(page, token_id):
     )
 
 
+def ensure_page(context, page):
+    try:
+        if page is None or page.is_closed():
+            page = context.new_page()
+            page.goto(START_URL, wait_until='domcontentloaded', timeout=60000)
+            page.wait_for_timeout(5000)
+            return page
+
+        title = page.title()
+        if 'Just a moment' in title:
+            print('Cloudflare page detected. Waiting 30 seconds...', flush=True)
+            page.wait_for_timeout(30000)
+        return page
+    except Exception:
+        page = context.new_page()
+        page.goto(START_URL, wait_until='domcontentloaded', timeout=60000)
+        page.wait_for_timeout(5000)
+        return page
+
+
 print('fast finished browser collector started', flush=True)
 print(f'profile dir: {Path(LOCAL_PROFILE_DIR).resolve()}', flush=True)
 print(f'headless: {HEADLESS}', flush=True)
+print(f'not_ready cooldown: {NOT_READY_MAX_RETRIES} retries / {NOT_READY_COOLDOWN_MINUTES} minutes', flush=True)
 
 with sync_playwright() as p:
     context = p.chromium.launch_persistent_context(
@@ -166,12 +219,13 @@ with sync_playwright() as p:
         tokens = get_candidate_tokens()
 
         if not tokens:
-            print('no token candidates yet', flush=True)
-            time.sleep(5)
+            print('no token candidates after cooldown filters', flush=True)
+            time.sleep(15)
             continue
 
         for token_id in tokens:
             try:
+                page = ensure_page(context, page)
                 result = fetch_fair_data(page, token_id)
                 status = result.get('status')
                 text = result.get('text') or ''
@@ -206,6 +260,10 @@ with sync_playwright() as p:
 
             except Exception as exc:
                 log_scan(token_id, 'error', str(exc))
+                try:
+                    page = ensure_page(context, page)
+                except Exception:
+                    page = None
 
             time.sleep(REQUEST_INTERVAL_SECONDS)
 
