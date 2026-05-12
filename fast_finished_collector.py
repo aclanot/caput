@@ -98,8 +98,8 @@ def get_candidate_tokens():
             token_id,
             COUNT(*) FILTER (WHERE status IN ('not_ready', 'no_fair_data')) AS not_ready_count,
             MAX(ts) FILTER (WHERE status IN ('not_ready', 'no_fair_data')) AS last_not_ready_ts,
-            COUNT(*) FILTER (WHERE status LIKE 'http_%' OR status = 'error') AS error_count,
-            MAX(ts) FILTER (WHERE status LIKE 'http_%' OR status = 'error') AS last_error_ts
+            COUNT(*) FILTER (WHERE status LIKE 'http_%%' OR status = 'error') AS error_count,
+            MAX(ts) FILTER (WHERE status LIKE 'http_%%' OR status = 'error') AS last_error_ts
         FROM fast_finished_scan_log
         GROUP BY token_id
     )
