@@ -50,11 +50,16 @@ def log_scan(token_id, status, note=''):
 
 def get_candidate_tokens():
     cur.execute('''
-    SELECT DISTINCT token_id
-    FROM token_snapshots
-    WHERE token_id IS NOT NULL
-      AND token_id NOT IN (SELECT token_id FROM finished_tokens)
-    ORDER BY token_id::BIGINT DESC
+    SELECT token_id
+    FROM (
+        SELECT token_id, MAX(token_id::BIGINT) AS token_num
+        FROM token_snapshots
+        WHERE token_id IS NOT NULL
+          AND token_id ~ '^[0-9]+$'
+          AND token_id NOT IN (SELECT token_id FROM finished_tokens)
+        GROUP BY token_id
+    ) t
+    ORDER BY token_num DESC
     LIMIT %s
     ''', (TOKEN_LIMIT,))
     return [row[0] for row in cur.fetchall()]
