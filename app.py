@@ -9,8 +9,8 @@ if not os.getenv('DATABASE_URL'):
     print('ERROR: DATABASE_URL is missing. Add Railway Postgres and reference Postgres.DATABASE_URL.', flush=True)
     sys.exit(1)
 
-print('Starting collector...', flush=True)
-processes.append(subprocess.Popen([sys.executable, 'collector.py']))
+print('Starting direct GraphQL collector...', flush=True)
+processes.append(subprocess.Popen([sys.executable, 'direct_collector.py']))
 
 if os.getenv('BOT_TOKEN'):
     print('BOT_TOKEN found. Starting Telegram bot...', flush=True)
