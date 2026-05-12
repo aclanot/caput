@@ -1,6 +1,5 @@
 import csv
 import io
-import json
 import os
 
 import psycopg
@@ -14,250 +13,221 @@ conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 
 
-def short_json(value, limit=3500):
-    try:
-        text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
-    except Exception:
-        text = str(value)
-    if len(text) > limit:
-        return text[:limit] + '\n... truncated ...'
-    return text
-
-
-def short_text(value, limit=3500):
-    text = value or ''
-    if len(text) > limit:
-        return text[:limit] + '\n... truncated ...'
-    return text
+def table_exists(cur, table_name):
+    cur.execute('SELECT to_regclass(%s)', (f'public.{table_name}',))
+    return cur.fetchone()[0] is not None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         'Caput bot online\n\n'
-        '/stats - dataset stats\n'
-        '/raw - raw GraphQL count\n'
-        '/ops - recent GraphQL operations\n'
-        '/lastraw - latest raw GraphQL response preview\n'
-        '/reqs - raw GraphQL request count\n'
-        '/lastreq - latest GraphQL request payload\n'
-        '/findticks - latest GraphQL requests/responses containing ticks or salt\n'
-        '/debug - latest collector debug\n'
-        '/latest - latest finished tokens\n'
-        '/export - export finished trajectories csv\n'
-        '/export_snapshots - export latest snapshots csv'
+        '/status - collector and dataset status\n'
+        '/summary - pattern summary by mode\n'
+        '/paper - paper simulation summary\n'
+        '/latest - latest saved trajectories\n'
+        '/export - export finished trajectories CSV\n'
+        '/export_features - export analysis features CSV'
     )
 
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
+
     cur.execute('SELECT COUNT(*) FROM finished_tokens')
     finished = cur.fetchone()[0]
+
     cur.execute('SELECT COUNT(*) FROM token_snapshots')
-    snaps = cur.fetchone()[0]
-    cur.execute('SELECT COUNT(*) FROM graphql_raw')
-    raw = cur.fetchone()[0]
-    cur.execute("SELECT to_regclass('public.graphql_requests')")
-    has_reqs = cur.fetchone()[0]
-    reqs = 0
-    if has_reqs:
-        cur.execute('SELECT COUNT(*) FROM graphql_requests')
-        reqs = cur.fetchone()[0]
-    cur.execute('SELECT COUNT(*) FROM collector_debug')
-    debug = cur.fetchone()[0]
+    snapshots = cur.fetchone()[0]
+
     cur.execute('SELECT MAX(ts) FROM token_snapshots')
     last_snapshot = cur.fetchone()[0]
-    await update.message.reply_text(
+
+    features = 0
+    if table_exists(cur, 'trajectory_features'):
+        cur.execute('SELECT COUNT(*) FROM trajectory_features')
+        features = cur.fetchone()[0]
+
+    paper = 0
+    if table_exists(cur, 'paper_trades'):
+        cur.execute('SELECT COUNT(*) FROM paper_trades')
+        paper = cur.fetchone()[0]
+    elif table_exists(cur, 'virtual_trades'):
+        cur.execute('SELECT COUNT(*) FROM virtual_trades')
+        paper = cur.fetchone()[0]
+
+    text = (
+        'Status\n\n'
         f'Finished trajectories: {finished}\n'
-        f'Snapshots: {snaps}\n'
-        f'Raw GraphQL: {raw}\n'
-        f'GraphQL requests: {reqs}\n'
-        f'Debug rows: {debug}\n'
-        f'Last snapshot: {last_snapshot}'
+        f'Live snapshots: {snapshots}\n'
+        f'Analysis rows: {features}\n'
+        f'Paper simulation trades: {paper}\n'
+        f'Last snapshot: {last_snapshot}\n\n'
+        'If finished trajectories are not growing, the collector is probably waiting for new expired tokens.'
     )
-
-
-async def raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur = conn.cursor()
-    cur.execute('SELECT COUNT(*) FROM graphql_raw')
-    count = cur.fetchone()[0]
-    await update.message.reply_text(f'Raw GraphQL rows: {count}')
-
-
-async def reqs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur = conn.cursor()
-    cur.execute("SELECT to_regclass('public.graphql_requests')")
-    if not cur.fetchone()[0]:
-        await update.message.reply_text('graphql_requests table does not exist yet')
-        return
-    cur.execute('SELECT COUNT(*) FROM graphql_requests')
-    count = cur.fetchone()[0]
-    await update.message.reply_text(f'GraphQL request rows: {count}')
-
-
-async def ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur = conn.cursor()
-    cur.execute('''
-    SELECT COALESCE(operation, 'NULL') AS op, COUNT(*)
-    FROM graphql_raw
-    GROUP BY COALESCE(operation, 'NULL')
-    ORDER BY COUNT(*) DESC
-    LIMIT 20
-    ''')
-    rows = cur.fetchall()
-    if not rows:
-        await update.message.reply_text('No GraphQL rows yet')
-        return
-    text = 'GraphQL operations:\n\n'
-    for op, count in rows:
-        text += f'{op}: {count}\n'
     await update.message.reply_text(text)
 
 
-async def lastraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
+
+    if not table_exists(cur, 'trajectory_features'):
+        await update.message.reply_text('No analysis table yet. Run: python analyze.py')
+        return
+
     cur.execute('''
-    SELECT id, ts, operation, response
-    FROM graphql_raw
-    ORDER BY id DESC
-    LIMIT 1
-    ''')
-    row = cur.fetchone()
-    if not row:
-        await update.message.reply_text('No raw GraphQL rows yet')
-        return
-    msg = f'id: {row[0]}\nts: {row[1]}\noperation: {row[2]}\n\n{short_json(row[3])}'
-    await update.message.reply_text(msg[:4000])
-
-
-async def lastreq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur = conn.cursor()
-    cur.execute("SELECT to_regclass('public.graphql_requests')")
-    if not cur.fetchone()[0]:
-        await update.message.reply_text('graphql_requests table does not exist yet')
-        return
-    cur.execute('''
-    SELECT id, ts, url, method, post_data, response
-    FROM graphql_requests
-    ORDER BY id DESC
-    LIMIT 1
-    ''')
-    row = cur.fetchone()
-    if not row:
-        await update.message.reply_text('No GraphQL request rows yet')
-        return
-    msg = (
-        f'id: {row[0]}\n'
-        f'ts: {row[1]}\n'
-        f'method: {row[3]}\n'
-        f'url: {row[2]}\n\n'
-        f'POST DATA:\n{short_text(row[4], 1800)}\n\n'
-        f'RESPONSE:\n{short_json(row[5], 1800)}'
-    )
-    await update.message.reply_text(msg[:4000])
-
-
-async def findticks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur = conn.cursor()
-    cur.execute("SELECT to_regclass('public.graphql_requests')")
-    if not cur.fetchone()[0]:
-        await update.message.reply_text('graphql_requests table does not exist yet')
-        return
-    cur.execute('''
-    SELECT id, ts, post_data, response
-    FROM graphql_requests
-    WHERE COALESCE(post_data, '') ILIKE '%tick%'
-       OR COALESCE(post_data, '') ILIKE '%salt%'
-       OR response::text ILIKE '%tick%'
-       OR response::text ILIKE '%salt%'
-    ORDER BY id DESC
-    LIMIT 5
+    SELECT
+        COALESCE(mode, 'UNKNOWN') AS mode,
+        COUNT(*) AS n,
+        AVG(final_return_pct) AS avg_final,
+        AVG(max_pump_pct) AS avg_pump,
+        AVG(max_drawdown_pct) AS avg_dd,
+        AVG(CASE WHEN final_return_pct < 0 THEN 1.0 ELSE 0.0 END) AS p_down,
+        AVG(CASE WHEN roundtrip_after_90dd THEN 1.0 ELSE 0.0 END) AS p_roundtrip,
+        AVG(CASE WHEN dead_bounce_20 THEN 1.0 ELSE 0.0 END) AS p_bounce,
+        AVG(CASE WHEN pump30_dump20 THEN 1.0 ELSE 0.0 END) AS p_pump_fail
+    FROM trajectory_features
+    GROUP BY COALESCE(mode, 'UNKNOWN')
+    ORDER BY n DESC
     ''')
     rows = cur.fetchall()
+
     if not rows:
-        await update.message.reply_text('No GraphQL requests/responses with tick/salt yet')
+        await update.message.reply_text('No analysis rows yet. Run: python analyze.py')
         return
-    text = 'tick/salt candidates:\n\n'
-    for row in rows:
-        pd = (row[2] or '')[:500].replace('\n', ' ')
-        resp = short_json(row[3], 700).replace('\n', ' ')
-        text += f'#{row[0]} {row[1]}\nPOST: {pd}\nRESP: {resp}\n\n'
+
+    text = 'Pattern summary by mode\n\n'
+    for r in rows:
+        text += (
+            f'{r[0]} | n={r[1]}\n'
+            f'avg final: {r[2]:.1f}% | avg pump: {r[3]:.1f}% | avg drawdown: {r[4]:.1f}%\n'
+            f'final below start: {r[5]*100:.1f}%\n'
+            f'roundtrip after -90%: {r[6]*100:.1f}%\n'
+            f'bounce after -90%: {r[7]*100:.1f}%\n'
+            f'pump +30 then fail: {r[8]*100:.1f}%\n\n'
+        )
+
     await update.message.reply_text(text[:4000])
 
 
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
-    cur.execute('''
-    SELECT id, ts, event, url, title, body_preview
-    FROM collector_debug
-    ORDER BY id DESC
-    LIMIT 5
+
+    table = None
+    if table_exists(cur, 'paper_trades'):
+        table = 'paper_trades'
+    elif table_exists(cur, 'virtual_trades'):
+        table = 'virtual_trades'
+
+    if not table:
+        await update.message.reply_text('No paper simulation table yet. Run the paper/backtest script after analyze.py.')
+        return
+
+    cur.execute(f'''
+    SELECT
+        strategy,
+        COALESCE(mode, 'UNKNOWN') AS mode,
+        COUNT(*) AS n,
+        AVG(pnl_pct) AS avg_pnl,
+        AVG(CASE WHEN pnl_pct > 0 THEN 1.0 ELSE 0.0 END) AS winrate,
+        MIN(pnl_pct) AS worst,
+        MAX(pnl_pct) AS best
+    FROM {table}
+    GROUP BY strategy, COALESCE(mode, 'UNKNOWN')
+    ORDER BY strategy, n DESC
     ''')
     rows = cur.fetchall()
+
     if not rows:
-        await update.message.reply_text('No debug rows yet')
+        await update.message.reply_text('No paper simulation rows yet.')
         return
-    text = 'Latest debug rows:\n\n'
-    for row in rows:
-        body = (row[5] or '')[:500].replace('\n', ' ')
-        text += f'#{row[0]} {row[1]}\n{row[2]} | {row[4]}\n{row[3]}\n{body}\n\n'
+
+    text = 'Paper simulation summary\n\n'
+    for r in rows:
+        text += (
+            f'{r[0]} / {r[1]} | n={r[2]}\n'
+            f'avg pnl: {r[3]:.2f}% | winrate: {r[4]*100:.1f}%\n'
+            f'worst: {r[5]:.2f}% | best: {r[6]:.2f}%\n\n'
+        )
+
     await update.message.reply_text(text[:4000])
 
 
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
-    cur.execute('SELECT token_id, ts FROM finished_tokens ORDER BY ts DESC LIMIT 10')
+    cur.execute('''
+    SELECT ft.token_id, ft.ts, tf.mode, tf.final_return_pct, tf.max_pump_pct, tf.max_drawdown_pct
+    FROM finished_tokens ft
+    LEFT JOIN trajectory_features tf ON tf.token_id = ft.token_id
+    ORDER BY ft.ts DESC
+    LIMIT 10
+    ''')
     rows = cur.fetchall()
+
     if not rows:
-        await update.message.reply_text('No finished tokens yet')
+        await update.message.reply_text('No finished trajectories yet.')
         return
-    text = 'Latest finished tokens:\n\n'
+
+    text = 'Latest trajectories\n\n'
     for r in rows:
-        text += f'{r[0]} | {r[1]}\n'
-    await update.message.reply_text(text)
+        if r[3] is None:
+            text += f'{r[0]} | {r[1]} | not analyzed yet\n'
+        else:
+            text += f'{r[0]} | {r[2]} | final {r[3]:.1f}% | pump {r[4]:.1f}% | dd {r[5]:.1f}%\n'
+
+    await update.message.reply_text(text[:4000])
 
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
-    cur.execute('SELECT token_id, ts, salt, ticks::text FROM finished_tokens ORDER BY ts DESC LIMIT 1000')
+    cur.execute('SELECT token_id, ts, salt, ticks::text FROM finished_tokens ORDER BY ts DESC LIMIT 2000')
     rows = cur.fetchall()
+
     csv_bytes = io.StringIO()
     writer = csv.writer(csv_bytes)
     writer.writerow(['token_id', 'ts', 'salt', 'ticks'])
     writer.writerows(rows)
+
     data = io.BytesIO(csv_bytes.getvalue().encode('utf-8'))
     data.seek(0)
     await update.message.reply_document(document=data, filename='finished_tokens.csv')
 
 
-async def export_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def export_features(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
+
+    if not table_exists(cur, 'trajectory_features'):
+        await update.message.reply_text('No analysis table yet. Run: python analyze.py')
+        return
+
     cur.execute('''
-    SELECT ts, token_id, mode, price, volume, buys, sells, traders
-    FROM token_snapshots
-    ORDER BY id DESC
+    SELECT token_id, mode, ticks_count, final_return_pct, max_pump_pct, max_drawdown_pct,
+           roundtrip_after_90dd, dead_bounce_20, pump30_dump20
+    FROM trajectory_features
+    ORDER BY updated_at DESC
     LIMIT 5000
     ''')
     rows = cur.fetchall()
+
     csv_bytes = io.StringIO()
     writer = csv.writer(csv_bytes)
-    writer.writerow(['ts', 'token_id', 'mode', 'price', 'volume', 'buys', 'sells', 'traders'])
+    writer.writerow([
+        'token_id', 'mode', 'ticks_count', 'final_return_pct', 'max_pump_pct', 'max_drawdown_pct',
+        'roundtrip_after_90dd', 'dead_bounce_20', 'pump30_dump20'
+    ])
     writer.writerows(rows)
+
     data = io.BytesIO(csv_bytes.getvalue().encode('utf-8'))
     data.seek(0)
-    await update.message.reply_document(document=data, filename='token_snapshots.csv')
+    await update.message.reply_document(document=data, filename='trajectory_features.csv')
 
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler('start', start))
-app.add_handler(CommandHandler('stats', stats))
-app.add_handler(CommandHandler('raw', raw))
-app.add_handler(CommandHandler('reqs', reqs))
-app.add_handler(CommandHandler('ops', ops))
-app.add_handler(CommandHandler('lastraw', lastraw))
-app.add_handler(CommandHandler('lastreq', lastreq))
-app.add_handler(CommandHandler('findticks', findticks))
-app.add_handler(CommandHandler('debug', debug))
+app.add_handler(CommandHandler('status', status))
+app.add_handler(CommandHandler('stats', status))
+app.add_handler(CommandHandler('summary', summary))
+app.add_handler(CommandHandler('paper', paper))
 app.add_handler(CommandHandler('latest', latest))
 app.add_handler(CommandHandler('export', export))
-app.add_handler(CommandHandler('export_snapshots', export_snapshots))
+app.add_handler(CommandHandler('export_features', export_features))
 app.run_polling()
