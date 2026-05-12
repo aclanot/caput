@@ -9,14 +9,23 @@ if not os.getenv('DATABASE_URL'):
     print('ERROR: DATABASE_URL is missing. Add Railway Postgres and reference Postgres.DATABASE_URL.', flush=True)
     sys.exit(1)
 
-print('Starting direct GraphQL collector...', flush=True)
-processes.append(subprocess.Popen([sys.executable, 'direct_collector.py']))
+bot_only = os.getenv('BOT_ONLY', '').lower() in ('1', 'true', 'yes', 'on')
+
+if bot_only:
+    print('BOT_ONLY=true. Collector disabled on Railway.', flush=True)
+else:
+    print('Starting direct GraphQL collector...', flush=True)
+    processes.append(subprocess.Popen([sys.executable, 'direct_collector.py']))
 
 if os.getenv('BOT_TOKEN'):
     print('BOT_TOKEN found. Starting Telegram bot...', flush=True)
     processes.append(subprocess.Popen([sys.executable, 'telegram_bot.py']))
 else:
-    print('BOT_TOKEN not set. Telegram bot disabled. Collector will still run.', flush=True)
+    print('BOT_TOKEN not set. Telegram bot disabled.', flush=True)
+
+if not processes:
+    print('No processes started. Set BOT_TOKEN and/or disable BOT_ONLY.', flush=True)
+    sys.exit(1)
 
 try:
     while True:
