@@ -2,20 +2,20 @@ import json
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 
 import psycopg
-import requests
 from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL')
-CF_CLEARANCE = os.getenv('CF_CLEARANCE', '').strip()
-CATAPULT_COOKIE = os.getenv('CATAPULT_COOKIE', '').strip()
-REQUEST_INTERVAL_SECONDS = float(os.getenv('FAST_FINISHED_INTERVAL_SECONDS', '0.25'))
+LOCAL_PROFILE_DIR = os.getenv('LOCAL_PROFILE_DIR', 'browser_profile_fast')
+HEADLESS = os.getenv('HEADLESS', 'false').lower() in ('1', 'true', 'yes', 'on')
+START_URL = os.getenv('START_URL', 'https://catapult.trade/turbo/discover')
+REQUEST_INTERVAL_SECONDS = float(os.getenv('FAST_FINISHED_INTERVAL_SECONDS', '0.15'))
 BATCH_LIMIT = int(os.getenv('FAST_FINISHED_BATCH_LIMIT', '200'))
-
-GRAPHQL_URL = 'https://catapult.trade/graphql'
 
 FAIR_QUERY = '''
 query TurboTokenFairData($tokenId: String!) {
@@ -45,30 +45,6 @@ query TurboTokenDetailsV2($tokenId: String!) {
 }
 '''
 
-HEADERS = {
-    'accept': '*/*',
-    'accept-language': 'en-US,en;q=0.9',
-    'content-type': 'application/json',
-    'origin': 'https://catapult.trade',
-    'referer': 'https://catapult.trade/turbo/discover',
-    'sec-ch-ua': '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-origin',
-    'user-agent': (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/125.0.0.0 Safari/537.36'
-    ),
-}
-
-if CATAPULT_COOKIE:
-    HEADERS['cookie'] = CATAPULT_COOKIE
-elif CF_CLEARANCE:
-    HEADERS['cookie'] = f'cf_clearance={CF_CLEARANCE}'
-
 conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 cur = conn.cursor()
@@ -91,8 +67,6 @@ CREATE TABLE IF NOT EXISTS fast_finished_scan_log (
     note TEXT
 )
 ''')
-
-session = requests.Session()
 
 
 def log_scan(token_id, status, note=''):
@@ -138,7 +112,6 @@ def build_payload(token_id):
 def save_finished(token_id, fair):
     salt = fair.get('fairSalt')
     ticks = fair.get('ticksArray')
-
     if not salt or not ticks:
         return False
 
@@ -147,62 +120,93 @@ def save_finished(token_id, fair):
     VALUES (%s,%s,%s,%s)
     ON CONFLICT (token_id) DO NOTHING
     ''', (str(token_id), datetime.utcnow(), salt, json.dumps(ticks)))
-
     return True
 
 
-print('fast finished collector started', flush=True)
-print(f'cookie configured: {bool(HEADERS.get("cookie"))}', flush=True)
+def fetch_fair_data(page, token_id):
+    payload = build_payload(token_id)
+    return page.evaluate(
+        '''async ({payload}) => {
+            const res = await fetch('/graphql', {
+                method: 'POST',
+                headers: {
+                    'accept': '*/*',
+                    'content-type': 'application/json'
+                },
+                body: JSON.stringify(payload),
+                credentials: 'include'
+            });
+            const text = await res.text();
+            return {status: res.status, text};
+        }''',
+        {'payload': payload},
+    )
 
-while True:
-    tokens = get_candidate_tokens()
 
-    if not tokens:
-        print('no token candidates yet', flush=True)
-        time.sleep(5)
-        continue
+print('fast finished browser collector started', flush=True)
+print(f'profile dir: {Path(LOCAL_PROFILE_DIR).resolve()}', flush=True)
+print(f'headless: {HEADLESS}', flush=True)
 
-    for token_id in tokens:
-        try:
-            r = session.post(
-                GRAPHQL_URL,
-                headers=HEADERS,
-                json=build_payload(token_id),
-                timeout=30,
-            )
+with sync_playwright() as p:
+    context = p.chromium.launch_persistent_context(
+        user_data_dir=LOCAL_PROFILE_DIR,
+        headless=HEADLESS,
+        viewport={'width': 1365, 'height': 768},
+        locale='en-US',
+        args=['--disable-blink-features=AutomationControlled'],
+    )
 
-            if r.status_code != 200:
-                log_scan(token_id, f'http_{r.status_code}', r.text[:300])
-                time.sleep(2)
-                continue
+    page = context.pages[0] if context.pages else context.new_page()
+    page.goto(START_URL, wait_until='domcontentloaded', timeout=60000)
+    page.wait_for_timeout(8000)
 
-            data = r.json()
+    print('Browser ready. If Cloudflare appears, solve it manually in the opened window.', flush=True)
 
-            fair = None
-            details = None
+    while True:
+        tokens = get_candidate_tokens()
 
-            if isinstance(data, list):
-                for entry in data:
-                    if entry.get('data', {}).get('turboTokenFairData'):
-                        fair = entry['data']['turboTokenFairData']
-                    if entry.get('data', {}).get('turboTokenDetailsV2'):
-                        details = entry['data']['turboTokenDetailsV2']
+        if not tokens:
+            print('no token candidates yet', flush=True)
+            time.sleep(5)
+            continue
 
-            if not fair:
-                log_scan(token_id, 'no_fair_data', 'missing turboTokenFairData')
-                continue
+        for token_id in tokens:
+            try:
+                result = fetch_fair_data(page, token_id)
+                status = result.get('status')
+                text = result.get('text') or ''
 
-            if save_finished(token_id, fair):
-                ticks_len = len(fair.get('ticksArray') or [])
-                expired = details.get('isExpired') if details else None
-                mode = details.get('speedMode') if details else None
-                log_scan(token_id, 'saved', f'ticks={ticks_len}; expired={expired}; mode={mode}')
-            else:
-                log_scan(token_id, 'not_ready', 'no fairSalt or ticksArray')
+                if status != 200:
+                    log_scan(token_id, f'http_{status}', text[:300])
+                    time.sleep(2)
+                    continue
 
-        except Exception as exc:
-            log_scan(token_id, 'error', str(exc))
+                data = json.loads(text)
+                fair = None
+                details = None
 
-        time.sleep(REQUEST_INTERVAL_SECONDS)
+                if isinstance(data, list):
+                    for entry in data:
+                        if entry.get('data', {}).get('turboTokenFairData'):
+                            fair = entry['data']['turboTokenFairData']
+                        if entry.get('data', {}).get('turboTokenDetailsV2'):
+                            details = entry['data']['turboTokenDetailsV2']
 
-    time.sleep(2)
+                if not fair:
+                    log_scan(token_id, 'no_fair_data', 'missing turboTokenFairData')
+                    continue
+
+                if save_finished(token_id, fair):
+                    ticks_len = len(fair.get('ticksArray') or [])
+                    expired = details.get('isExpired') if details else None
+                    mode = details.get('speedMode') if details else None
+                    log_scan(token_id, 'saved', f'ticks={ticks_len}; expired={expired}; mode={mode}')
+                else:
+                    log_scan(token_id, 'not_ready', 'no fairSalt or ticksArray')
+
+            except Exception as exc:
+                log_scan(token_id, 'error', str(exc))
+
+            time.sleep(REQUEST_INTERVAL_SECONDS)
+
+        time.sleep(2)
