@@ -1,8 +1,9 @@
+import csv
 import json
 import os
+from collections import defaultdict
 from datetime import datetime
 
-import pandas as pd
 import psycopg
 from dotenv import load_dotenv
 
@@ -14,6 +15,27 @@ OUTPUT_DIR = os.getenv('ANALYZE_OUTPUT_DIR', 'analysis_output')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 conn = psycopg.connect(DATABASE_URL)
+conn.autocommit = True
+cur = conn.cursor()
+
+cur.execute('''
+CREATE TABLE IF NOT EXISTS trajectory_features (
+    token_id TEXT PRIMARY KEY,
+    mode TEXT,
+    ticks_count INT,
+    start_price DOUBLE PRECISION,
+    end_price DOUBLE PRECISION,
+    max_price DOUBLE PRECISION,
+    min_price DOUBLE PRECISION,
+    final_return_pct DOUBLE PRECISION,
+    max_pump_pct DOUBLE PRECISION,
+    max_drawdown_pct DOUBLE PRECISION,
+    roundtrip_after_90dd BOOLEAN,
+    dead_bounce_20 BOOLEAN,
+    pump30_dump20 BOOLEAN,
+    updated_at TIMESTAMP
+)
+''')
 
 QUERY = '''
 SELECT
@@ -33,18 +55,15 @@ LEFT JOIN LATERAL (
 '''
 
 print('loading finished trajectories...', flush=True)
+cur.execute(QUERY)
+source_rows = cur.fetchall()
+print(f'loaded trajectories: {len(source_rows)}', flush=True)
 
-df = pd.read_sql(QUERY, conn)
+features = []
 
-print(f'loaded trajectories: {len(df)}', flush=True)
-
-rows = []
-
-for _, row in df.iterrows():
+for token_id, ts, ticks, mode in source_rows:
     try:
-        token_id = row['token_id']
-        mode = row['mode'] or 'UNKNOWN'
-        ticks = row['ticks']
+        mode = mode or 'UNKNOWN'
 
         if isinstance(ticks, str):
             ticks = json.loads(ticks)
@@ -63,10 +82,6 @@ for _, row in df.iterrows():
         max_pump_pct = (max_price / start - 1) * 100
         max_drawdown_pct = (min_price / start - 1) * 100
 
-        roundtrip_after_90dd = False
-        dead_bounce_20 = False
-        pump30_dump20 = False
-
         hit_90dd_index = None
         hit_pump30_index = None
 
@@ -79,23 +94,21 @@ for _, row in df.iterrows():
             if hit_pump30_index is None and rel >= 1.3:
                 hit_pump30_index = i
 
+        roundtrip_after_90dd = False
+        dead_bounce_20 = False
+        pump30_dump20 = False
+
         if hit_90dd_index is not None:
             future = ticks[hit_90dd_index:]
-
-            if max(future) >= start:
-                roundtrip_after_90dd = True
-
-            if max(future) >= start * 0.2:
-                dead_bounce_20 = True
+            roundtrip_after_90dd = max(future) >= start
+            dead_bounce_20 = max(future) >= start * 0.2
 
         if hit_pump30_index is not None:
             future = ticks[hit_pump30_index:]
+            pump30_dump20 = min(future) <= start * 0.8
 
-            if min(future) <= start * 0.8:
-                pump30_dump20 = True
-
-        rows.append({
-            'token_id': token_id,
+        row = {
+            'token_id': str(token_id),
             'mode': mode,
             'ticks_count': len(ticks),
             'start_price': start,
@@ -108,43 +121,91 @@ for _, row in df.iterrows():
             'roundtrip_after_90dd': roundtrip_after_90dd,
             'dead_bounce_20': dead_bounce_20,
             'pump30_dump20': pump30_dump20,
-        })
+        }
+        features.append(row)
+
+        cur.execute('''
+        INSERT INTO trajectory_features(
+            token_id, mode, ticks_count, start_price, end_price, max_price, min_price,
+            final_return_pct, max_pump_pct, max_drawdown_pct,
+            roundtrip_after_90dd, dead_bounce_20, pump30_dump20, updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (token_id) DO UPDATE SET
+            mode = EXCLUDED.mode,
+            ticks_count = EXCLUDED.ticks_count,
+            start_price = EXCLUDED.start_price,
+            end_price = EXCLUDED.end_price,
+            max_price = EXCLUDED.max_price,
+            min_price = EXCLUDED.min_price,
+            final_return_pct = EXCLUDED.final_return_pct,
+            max_pump_pct = EXCLUDED.max_pump_pct,
+            max_drawdown_pct = EXCLUDED.max_drawdown_pct,
+            roundtrip_after_90dd = EXCLUDED.roundtrip_after_90dd,
+            dead_bounce_20 = EXCLUDED.dead_bounce_20,
+            pump30_dump20 = EXCLUDED.pump30_dump20,
+            updated_at = EXCLUDED.updated_at
+        ''', (
+            row['token_id'], row['mode'], row['ticks_count'], row['start_price'], row['end_price'],
+            row['max_price'], row['min_price'], row['final_return_pct'], row['max_pump_pct'],
+            row['max_drawdown_pct'], row['roundtrip_after_90dd'], row['dead_bounce_20'],
+            row['pump30_dump20'], datetime.utcnow(),
+        ))
 
     except Exception as exc:
-        print(f'failed processing token: {exc}', flush=True)
+        print(f'failed processing token {token_id}: {exc}', flush=True)
 
-features_df = pd.DataFrame(rows)
-
-if features_df.empty:
+if not features:
     print('no features extracted', flush=True)
     raise SystemExit(0)
 
 features_path = os.path.join(OUTPUT_DIR, 'trajectory_features.csv')
-features_df.to_csv(features_path, index=False)
+with open(features_path, 'w', newline='', encoding='utf-8') as f:
+    writer = csv.DictWriter(f, fieldnames=list(features[0].keys()))
+    writer.writeheader()
+    writer.writerows(features)
 
 print(f'saved features: {features_path}', flush=True)
 
 summary = []
+by_mode = defaultdict(list)
+for row in features:
+    by_mode[row['mode']].append(row)
 
-for mode, g in features_df.groupby('mode'):
+for mode, rows in sorted(by_mode.items(), key=lambda item: len(item[1]), reverse=True):
+    n = len(rows)
+
+    def avg(key):
+        return sum(float(r[key]) for r in rows) / n
+
     summary.append({
         'mode': mode,
-        'n': len(g),
-        'avg_final_return_pct': g['final_return_pct'].mean(),
-        'avg_max_pump_pct': g['max_pump_pct'].mean(),
-        'avg_max_drawdown_pct': g['max_drawdown_pct'].mean(),
-        'p_final_below_start': (g['final_return_pct'] < 0).mean(),
-        'p_roundtrip_after_90dd': g['roundtrip_after_90dd'].mean(),
-        'p_dead_bounce_20': g['dead_bounce_20'].mean(),
-        'p_pump30_dump20': g['pump30_dump20'].mean(),
+        'n': n,
+        'avg_final_return_pct': avg('final_return_pct'),
+        'avg_max_pump_pct': avg('max_pump_pct'),
+        'avg_max_drawdown_pct': avg('max_drawdown_pct'),
+        'p_final_below_start': sum(1 for r in rows if r['final_return_pct'] < 0) / n,
+        'p_roundtrip_after_90dd': sum(1 for r in rows if r['roundtrip_after_90dd']) / n,
+        'p_dead_bounce_20': sum(1 for r in rows if r['dead_bounce_20']) / n,
+        'p_pump30_dump20': sum(1 for r in rows if r['pump30_dump20']) / n,
     })
 
-summary_df = pd.DataFrame(summary)
 summary_path = os.path.join(OUTPUT_DIR, 'mode_summary.csv')
-summary_df.to_csv(summary_path, index=False)
+with open(summary_path, 'w', newline='', encoding='utf-8') as f:
+    writer = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
+    writer.writeheader()
+    writer.writerows(summary)
 
 print('\nMODE SUMMARY\n', flush=True)
-print(summary_df.to_string(index=False), flush=True)
+for row in summary:
+    print(
+        f"{row['mode']} | n={row['n']} | avg_final={row['avg_final_return_pct']:.2f}% | "
+        f"avg_pump={row['avg_max_pump_pct']:.2f}% | avg_dd={row['avg_max_drawdown_pct']:.2f}% | "
+        f"down={row['p_final_below_start']*100:.1f}% | "
+        f"roundtrip90={row['p_roundtrip_after_90dd']*100:.1f}% | "
+        f"bounce90={row['p_dead_bounce_20']*100:.1f}% | "
+        f"pumpfail={row['p_pump30_dump20']*100:.1f}%",
+        flush=True,
+    )
 
 print(f'\nsaved summary: {summary_path}', flush=True)
 print(f'analysis completed at {datetime.utcnow()} UTC', flush=True)
