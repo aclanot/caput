@@ -3,20 +3,20 @@ import io
 import json
 import os
 
-import psycopg2
+import psycopg
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 DATABASE_URL = os.getenv('DATABASE_URL')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
-conn = psycopg2.connect(DATABASE_URL)
+conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 
 
 def short_json(value, limit=3500):
     try:
-        text = json.dumps(value, ensure_ascii=False, indent=2)
+        text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
     except Exception:
         text = str(value)
 
@@ -41,19 +41,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
-
     cur.execute('SELECT COUNT(*) FROM finished_tokens')
     finished = cur.fetchone()[0]
-
     cur.execute('SELECT COUNT(*) FROM token_snapshots')
     snaps = cur.fetchone()[0]
-
     cur.execute('SELECT COUNT(*) FROM graphql_raw')
     raw = cur.fetchone()[0]
-
     cur.execute('SELECT COUNT(*) FROM collector_debug')
     debug = cur.fetchone()[0]
-
     cur.execute('SELECT MAX(ts) FROM token_snapshots')
     last_snapshot = cur.fetchone()[0]
 
@@ -115,7 +110,6 @@ async def lastraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'operation: {row[2]}\n\n'
         f'{short_json(row[3])}'
     )
-
     await update.message.reply_text(msg[:4000])
 
 
@@ -143,14 +137,12 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
-
     cur.execute('''
     SELECT token_id, ts
     FROM finished_tokens
     ORDER BY ts DESC
     LIMIT 10
     ''')
-
     rows = cur.fetchall()
 
     if not rows:
@@ -158,7 +150,6 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = 'Latest finished tokens:\n\n'
-
     for r in rows:
         text += f'{r[0]} | {r[1]}\n'
 
@@ -182,11 +173,7 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = io.BytesIO(csv_bytes.getvalue().encode('utf-8'))
     data.seek(0)
-
-    await update.message.reply_document(
-        document=data,
-        filename='finished_tokens.csv'
-    )
+    await update.message.reply_document(document=data, filename='finished_tokens.csv')
 
 
 async def export_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,15 +193,10 @@ async def export_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = io.BytesIO(csv_bytes.getvalue().encode('utf-8'))
     data.seek(0)
-
-    await update.message.reply_document(
-        document=data,
-        filename='token_snapshots.csv'
-    )
+    await update.message.reply_document(document=data, filename='token_snapshots.csv')
 
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
-
 app.add_handler(CommandHandler('start', start))
 app.add_handler(CommandHandler('stats', stats))
 app.add_handler(CommandHandler('raw', raw))
@@ -224,5 +206,4 @@ app.add_handler(CommandHandler('debug', debug))
 app.add_handler(CommandHandler('latest', latest))
 app.add_handler(CommandHandler('export', export))
 app.add_handler(CommandHandler('export_snapshots', export_snapshots))
-
 app.run_polling()
