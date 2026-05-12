@@ -3,8 +3,11 @@ import os
 import time
 from datetime import datetime
 
-import psycopg2
+import psycopg
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL')
 CATAPULT_COOKIE = os.getenv('CATAPULT_COOKIE', '').strip()
@@ -12,7 +15,7 @@ CF_CLEARANCE = os.getenv('CF_CLEARANCE', '').strip()
 PROXY_URL = os.getenv('PROXY_URL', '').strip()
 REQUEST_INTERVAL_SECONDS = int(os.getenv('REQUEST_INTERVAL_SECONDS', '10'))
 
-conn = psycopg2.connect(DATABASE_URL)
+conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 cur = conn.cursor()
 
