@@ -1,6 +1,5 @@
 # caput
-
-Catapult trajectory collection + analysis pipeline.
+ trajectory collection + analysis pipeline.
 
 Goal:
 
