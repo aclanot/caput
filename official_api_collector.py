@@ -13,10 +13,12 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 API_URL = os.getenv('CATAPULT_API_URL', 'https://public-api.catapult.trade/graphql').strip()
 API_KEY = os.getenv('CATAPULT_API_KEY', '').strip()
 API_INTERVAL_SECONDS = float(os.getenv('API_COLLECTOR_INTERVAL_SECONDS', '10'))
-API_LIMIT = float(os.getenv('API_COLLECTOR_LIMIT', '50'))
+API_LIMIT = float(os.getenv('API_COLLECTOR_LIMIT', '100'))
 API_SPEED_MODE = os.getenv('API_COLLECTOR_SPEED_MODE', '').strip().upper()
 API_SORT_FIELD = os.getenv('API_COLLECTOR_SORT_FIELD', 'StartTime').strip()
 API_SORT_DIRECTION = os.getenv('API_COLLECTOR_SORT_DIRECTION', 'Desc').strip()
+API_PAGES_PER_CYCLE = int(os.getenv('API_COLLECTOR_PAGES_PER_CYCLE', '3'))
+API_PAGE_SLEEP_SECONDS = float(os.getenv('API_COLLECTOR_PAGE_SLEEP_SECONDS', '0.2'))
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -109,6 +111,11 @@ CREATE TABLE IF NOT EXISTS official_api_collector_log (
 )
 ''')
 
+cur.execute('CREATE INDEX IF NOT EXISTS idx_token_snapshots_token_ts ON token_snapshots(token_id, ts)')
+cur.execute('CREATE INDEX IF NOT EXISTS idx_token_snapshots_ts ON token_snapshots(ts)')
+cur.execute('CREATE INDEX IF NOT EXISTS idx_official_api_token_state_end_date ON official_api_token_state(end_date)')
+cur.execute('CREATE INDEX IF NOT EXISTS idx_official_api_token_state_updated_at ON official_api_token_state(updated_at)')
+
 
 def utcnow():
     return datetime.now(UTC).replace(tzinfo=None)
@@ -149,9 +156,13 @@ def log_status(status, note=''):
     print(f'official api collector: {status} | {note[:200]}', flush=True)
 
 
-def build_input():
+def build_input(after_cursor=None):
+    pagination = {'limit': API_LIMIT}
+    if after_cursor:
+        pagination['afterCursor'] = after_cursor
+
     result = {
-        'pagination': {'limit': API_LIMIT},
+        'pagination': pagination,
         'sort': {'field': API_SORT_FIELD, 'direction': API_SORT_DIRECTION},
     }
     if API_SPEED_MODE:
@@ -159,7 +170,7 @@ def build_input():
     return result
 
 
-def fetch_tokens():
+def fetch_tokens(after_cursor=None):
     headers = {
         'accept': 'application/json',
         'content-type': 'application/json',
@@ -168,7 +179,7 @@ def fetch_tokens():
     payload = {
         'query': TOKENS_QUERY,
         'operationName': 'OfficialApiTokens',
-        'variables': {'input': build_input()},
+        'variables': {'input': build_input(after_cursor=after_cursor)},
     }
     return requests.post(API_URL, headers=headers, json=payload, timeout=30)
 
@@ -196,16 +207,7 @@ def save_items(items):
             INSERT INTO token_snapshots(ts, token_id, mode, price, volume, buys, sells, traders)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             ''',
-            (
-                now,
-                token_id,
-                item.get('speedMode'),
-                price,
-                volume,
-                buys,
-                sells,
-                traders,
-            ),
+            (now, token_id, item.get('speedMode'), price, volume, buys, sells, traders),
         )
 
         cur.execute(
@@ -232,63 +234,67 @@ def save_items(items):
                 updated_at = EXCLUDED.updated_at
             ''',
             (
-                token_id,
-                item.get('name'),
-                item.get('symbol'),
-                item.get('speedMode'),
-                item.get('rank'),
-                initial_price,
-                price,
-                start_date,
-                end_date,
-                volume,
-                buys,
-                sells,
-                traders,
-                json.dumps(item),
-                now,
-                now,
+                token_id, item.get('name'), item.get('symbol'), item.get('speedMode'), item.get('rank'),
+                initial_price, price, start_date, end_date, volume, buys, sells, traders,
+                json.dumps(item), now, now,
             ),
         )
 
         cur.execute(
-            '''
-            INSERT INTO official_api_tokens_raw(ts, token_id, response)
-            VALUES (%s,%s,%s)
-            ''',
+            'INSERT INTO official_api_tokens_raw(ts, token_id, response) VALUES (%s,%s,%s)',
             (now, token_id, json.dumps(item)),
         )
         saved += 1
     return saved
 
 
+def fetch_and_save_cycle():
+    after_cursor = None
+    total_items = 0
+    total_saved = 0
+    pages = 0
+    last_has_next = None
+
+    for page_index in range(API_PAGES_PER_CYCLE):
+        response = fetch_tokens(after_cursor=after_cursor)
+        if response.status_code != 200:
+            log_status(f'http_{response.status_code}', response.text[:500])
+            break
+
+        data = response.json()
+        if data.get('errors'):
+            log_status('graphql_errors', json.dumps(data.get('errors'))[:500])
+            break
+
+        tokens = data.get('data', {}).get('tokens') or {}
+        items = tokens.get('items') or []
+        meta = tokens.get('meta') or {}
+        saved = save_items(items)
+
+        pages += 1
+        total_items += len(items)
+        total_saved += saved
+        last_has_next = meta.get('hasNextItems')
+        after_cursor = meta.get('lastCursor')
+
+        if not after_cursor or not last_has_next:
+            break
+        if page_index + 1 < API_PAGES_PER_CYCLE:
+            time.sleep(API_PAGE_SLEEP_SECONDS)
+
+    log_status('saved', f'pages={pages} items={total_items} snapshots={total_saved} hasNext={last_has_next}')
+
+
 def main():
     print('official api collector started', flush=True)
     print(f'API_URL={API_URL}', flush=True)
-    print(f'interval={API_INTERVAL_SECONDS}s limit={API_LIMIT}', flush=True)
+    print(f'interval={API_INTERVAL_SECONDS}s limit={API_LIMIT} pages={API_PAGES_PER_CYCLE}', flush=True)
     print(f'sort={API_SORT_FIELD} {API_SORT_DIRECTION} speed_mode={API_SPEED_MODE or "ALL"}', flush=True)
     print('read-only: tokens query only, no mutations', flush=True)
 
     while True:
         try:
-            response = fetch_tokens()
-            if response.status_code != 200:
-                log_status(f'http_{response.status_code}', response.text[:500])
-                time.sleep(API_INTERVAL_SECONDS)
-                continue
-
-            data = response.json()
-            if data.get('errors'):
-                log_status('graphql_errors', json.dumps(data.get('errors'))[:500])
-                time.sleep(API_INTERVAL_SECONDS)
-                continue
-
-            tokens = data.get('data', {}).get('tokens') or {}
-            items = tokens.get('items') or []
-            meta = tokens.get('meta') or {}
-            saved = save_items(items)
-            log_status('saved', f'items={len(items)} snapshots={saved} hasNext={meta.get("hasNextItems")}')
-
+            fetch_and_save_cycle()
         except Exception as exc:
             log_status('error', str(exc))
 
