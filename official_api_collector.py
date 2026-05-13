@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 import psycopg
 import requests
@@ -71,6 +71,27 @@ CREATE TABLE IF NOT EXISTS token_snapshots (
 ''')
 
 cur.execute('''
+CREATE TABLE IF NOT EXISTS official_api_token_state (
+    token_id TEXT PRIMARY KEY,
+    name TEXT,
+    symbol TEXT,
+    mode TEXT,
+    rank TEXT,
+    initial_price DOUBLE PRECISION,
+    current_price DOUBLE PRECISION,
+    start_date TIMESTAMP,
+    end_date TIMESTAMP,
+    volume DOUBLE PRECISION,
+    buys INT,
+    sells INT,
+    traders INT,
+    raw JSONB,
+    first_seen TIMESTAMP,
+    updated_at TIMESTAMP
+)
+''')
+
+cur.execute('''
 CREATE TABLE IF NOT EXISTS official_api_tokens_raw (
     id BIGSERIAL PRIMARY KEY,
     ts TIMESTAMP,
@@ -87,6 +108,19 @@ CREATE TABLE IF NOT EXISTS official_api_collector_log (
     note TEXT
 )
 ''')
+
+
+def utcnow():
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def parse_api_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).replace(tzinfo=None)
+    except Exception:
+        return None
 
 
 def to_float(value):
@@ -110,7 +144,7 @@ def to_int(value):
 def log_status(status, note=''):
     cur.execute(
         'INSERT INTO official_api_collector_log(ts, status, note) VALUES (%s,%s,%s)',
-        (datetime.utcnow(), status, note[:1000]),
+        (utcnow(), status, note[:1000]),
     )
     print(f'official api collector: {status} | {note[:200]}', flush=True)
 
@@ -136,19 +170,27 @@ def fetch_tokens():
         'operationName': 'OfficialApiTokens',
         'variables': {'input': build_input()},
     }
-    response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-    return response
+    return requests.post(API_URL, headers=headers, json=payload, timeout=30)
 
 
 def save_items(items):
     saved = 0
-    now = datetime.utcnow()
+    now = utcnow()
     for item in items:
         token_id = item.get('id')
         if not token_id:
             continue
 
+        token_id = str(token_id)
         volume = to_float(item.get('volumeUsdtDrops'))
+        price = to_float(item.get('price'))
+        initial_price = to_float(item.get('initialPrice'))
+        buys = to_int(item.get('buysCount'))
+        sells = to_int(item.get('sellsCount'))
+        traders = to_int(item.get('uniqueTradersCount'))
+        start_date = parse_api_datetime(item.get('startDate'))
+        end_date = parse_api_datetime(item.get('endDate'))
+
         cur.execute(
             '''
             INSERT INTO token_snapshots(ts, token_id, mode, price, volume, buys, sells, traders)
@@ -156,21 +198,65 @@ def save_items(items):
             ''',
             (
                 now,
-                str(token_id),
+                token_id,
                 item.get('speedMode'),
-                to_float(item.get('price')),
+                price,
                 volume,
-                to_int(item.get('buysCount')),
-                to_int(item.get('sellsCount')),
-                to_int(item.get('uniqueTradersCount')),
+                buys,
+                sells,
+                traders,
             ),
         )
+
+        cur.execute(
+            '''
+            INSERT INTO official_api_token_state(
+                token_id, name, symbol, mode, rank,
+                initial_price, current_price, start_date, end_date,
+                volume, buys, sells, traders, raw, first_seen, updated_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(token_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                symbol = EXCLUDED.symbol,
+                mode = EXCLUDED.mode,
+                rank = EXCLUDED.rank,
+                initial_price = EXCLUDED.initial_price,
+                current_price = EXCLUDED.current_price,
+                start_date = EXCLUDED.start_date,
+                end_date = EXCLUDED.end_date,
+                volume = EXCLUDED.volume,
+                buys = EXCLUDED.buys,
+                sells = EXCLUDED.sells,
+                traders = EXCLUDED.traders,
+                raw = EXCLUDED.raw,
+                updated_at = EXCLUDED.updated_at
+            ''',
+            (
+                token_id,
+                item.get('name'),
+                item.get('symbol'),
+                item.get('speedMode'),
+                item.get('rank'),
+                initial_price,
+                price,
+                start_date,
+                end_date,
+                volume,
+                buys,
+                sells,
+                traders,
+                json.dumps(item),
+                now,
+                now,
+            ),
+        )
+
         cur.execute(
             '''
             INSERT INTO official_api_tokens_raw(ts, token_id, response)
             VALUES (%s,%s,%s)
             ''',
-            (now, str(token_id), json.dumps(item)),
+            (now, token_id, json.dumps(item)),
         )
         saved += 1
     return saved
