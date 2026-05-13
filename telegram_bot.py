@@ -15,6 +15,14 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 BACKUP_MAX_ROWS_PER_TABLE = int(os.getenv('BACKUP_MAX_ROWS_PER_TABLE', '0'))
 BACKUP_INCLUDE_SNAPSHOTS = os.getenv('BACKUP_INCLUDE_SNAPSHOTS', 'true').lower() in ('1', 'true', 'yes', 'on')
 PG_DUMP_TIMEOUT_SECONDS = int(os.getenv('PG_DUMP_TIMEOUT_SECONDS', '600'))
+TELEGRAM_MAX_UPLOAD_MB = float(os.getenv('TELEGRAM_MAX_UPLOAD_MB', '45'))
+PG_DUMP_ESSENTIAL_TABLES = [
+    'finished_tokens',
+    'trajectory_features',
+    'paper_trades',
+    'strategy_sweep',
+    'trajectory_clusters',
+]
 PG_DUMP_CORE_TABLES = [
     'finished_tokens',
     'trajectory_features',
@@ -102,20 +110,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Caput bot online\n\n'
         '/status - collector and dataset status\n'
         '/backup - export DB CSV ZIP\n'
+        '/pg_dump_essential - smallest PostgreSQL dump, best for Telegram\n'
         '/pg_dump_core - PostgreSQL dump without token_snapshots/logs\n'
-        '/pg_dump - full PostgreSQL dump (.dump)'
+        '/pg_dump - full PostgreSQL dump, can be too large for Telegram'
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
-
     cur.execute('SELECT COUNT(*) FROM finished_tokens')
     finished = cur.fetchone()[0]
-
     cur.execute('SELECT COUNT(*) FROM token_snapshots')
     snapshots = cur.fetchone()[0]
-
     cur.execute('SELECT MAX(ts) FROM token_snapshots')
     last_snapshot = cur.fetchone()[0]
 
@@ -156,7 +162,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     await update.message.reply_text('Creating CSV backup ZIP...')
-
     zip_buffer = io.BytesIO()
     manifest_lines = [
         'caput backup',
@@ -166,7 +171,6 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '',
         'tables:',
     ]
-
     with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
         for table_name in BACKUP_TABLES:
             try:
@@ -175,9 +179,7 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     manifest_lines.append(f'- {table_name}: {row_count} rows')
             except Exception as exc:
                 manifest_lines.append(f'- {table_name}: ERROR {exc}')
-
         zf.writestr('MANIFEST.txt', '\n'.join(manifest_lines) + '\n')
-
     zip_buffer.seek(0)
     filename = f'caput_backup_{utc_stamp()}.zip'
     await update.message.reply_document(document=zip_buffer, filename=filename)
@@ -185,7 +187,6 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_pg_dump(update: Update, table_names=None, label='full'):
     await update.message.reply_text(f'Creating PostgreSQL {label} pg_dump backup...')
-
     selected_tables = existing_tables(table_names) if table_names else None
     if table_names and not selected_tables:
         await update.message.reply_text('No requested tables exist yet, nothing to dump.')
@@ -193,38 +194,24 @@ async def run_pg_dump(update: Update, table_names=None, label='full'):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         dump_path = os.path.join(tmpdir, 'caput_pg_dump.dump')
-
         dump_cmd = [
-            'pg_dump',
-            '--format=custom',
-            '--compress=9',
-            '--no-owner',
-            '--no-privileges',
-            DATABASE_URL,
-            '-f',
-            dump_path,
+            'pg_dump', '--format=custom', '--compress=9', '--no-owner', '--no-privileges',
+            DATABASE_URL, '-f', dump_path,
         ]
-
         if selected_tables:
             for table_name in selected_tables:
                 dump_cmd.extend(['--table', f'public.{safe_identifier(table_name)}'])
 
         try:
-            dump_proc = subprocess.run(
-                dump_cmd,
-                capture_output=True,
-                text=True,
-                timeout=PG_DUMP_TIMEOUT_SECONDS,
-            )
+            dump_proc = subprocess.run(dump_cmd, capture_output=True, text=True, timeout=PG_DUMP_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             await update.message.reply_text(
-                f'pg_dump timed out after {PG_DUMP_TIMEOUT_SECONDS}s. Use /pg_dump_core or increase PG_DUMP_TIMEOUT_SECONDS.'
+                f'pg_dump timed out after {PG_DUMP_TIMEOUT_SECONDS}s. Use /pg_dump_essential or increase PG_DUMP_TIMEOUT_SECONDS.'
             )
             return
 
         if dump_proc.returncode != 0:
-            err = dump_proc.stderr[-3000:]
-            await update.message.reply_text(f'pg_dump failed:\n\n{err}')
+            await update.message.reply_text(f'pg_dump failed:\n\n{dump_proc.stderr[-3000:]}')
             return
 
         filename = f'caput_pg_dump_{label}_{utc_stamp()}.dump'
@@ -232,10 +219,21 @@ async def run_pg_dump(update: Update, table_names=None, label='full'):
         table_note = ''
         if selected_tables:
             table_note = '\nTables: ' + ', '.join(selected_tables)
-        await update.message.reply_text(f'pg_dump ready: {size_mb:.2f} MB. Uploading...{table_note}')
 
-        with open(dump_path, 'rb') as f:
-            await update.message.reply_document(document=f, filename=filename)
+        if size_mb > TELEGRAM_MAX_UPLOAD_MB:
+            await update.message.reply_text(
+                f'pg_dump ready but too large for Telegram: {size_mb:.2f} MB.\n'
+                f'Configured Telegram limit: {TELEGRAM_MAX_UPLOAD_MB:.2f} MB.\n'
+                f'Use /pg_dump_essential for a smaller backup or store full backups outside Telegram.{table_note}'
+            )
+            return
+
+        await update.message.reply_text(f'pg_dump ready: {size_mb:.2f} MB. Uploading...{table_note}')
+        try:
+            with open(dump_path, 'rb') as f:
+                await update.message.reply_document(document=f, filename=filename)
+        except Exception as exc:
+            await update.message.reply_text(f'Telegram upload failed: {exc}')
 
 
 async def pg_dump_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -246,6 +244,10 @@ async def pg_dump_core(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_pg_dump(update, table_names=PG_DUMP_CORE_TABLES, label='core')
 
 
+async def pg_dump_essential(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_pg_dump(update, table_names=PG_DUMP_ESSENTIAL_TABLES, label='essential')
+
+
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler('start', start))
 app.add_handler(CommandHandler('status', status))
@@ -253,4 +255,5 @@ app.add_handler(CommandHandler('stats', status))
 app.add_handler(CommandHandler('backup', backup))
 app.add_handler(CommandHandler('pg_dump', pg_dump_backup))
 app.add_handler(CommandHandler('pg_dump_core', pg_dump_core))
+app.add_handler(CommandHandler('pg_dump_essential', pg_dump_essential))
 app.run_polling()
