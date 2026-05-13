@@ -8,7 +8,9 @@ load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL')
 MIN_SNAPSHOTS = int(os.getenv('LIVE_FEATURES_MIN_SNAPSHOTS', '2'))
-LOOKBACK_MINUTES = int(os.getenv('LIVE_FEATURES_LOOKBACK_MINUTES', '30'))
+LOOKBACK_MINUTES = int(os.getenv('LIVE_FEATURES_LOOKBACK_MINUTES', '10'))
+STALE_SECONDS = int(os.getenv('LIVE_FEATURES_STALE_SECONDS', '12'))
+PRINT_LIMIT = int(os.getenv('LIVE_FEATURES_PRINT_LIMIT', '10'))
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -20,6 +22,7 @@ cur = conn.cursor()
 
 def utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 cur.execute('''
 CREATE TABLE IF NOT EXISTS live_token_features (
@@ -96,6 +99,7 @@ SELECT
     %s
 FROM grouped
 WHERE snapshots >= %s
+  AND last_seen >= NOW() - (%s || ' seconds')::interval
   AND initial_price IS NOT NULL
   AND current_price IS NOT NULL
   AND initial_price > 0
@@ -116,23 +120,40 @@ ON CONFLICT(token_id) DO UPDATE SET
     traders = EXCLUDED.traders,
     buy_sell_ratio = EXCLUDED.buy_sell_ratio,
     updated_at = EXCLUDED.updated_at
-''', (LOOKBACK_MINUTES, utcnow(), MIN_SNAPSHOTS))
+''', (LOOKBACK_MINUTES, utcnow(), MIN_SNAPSHOTS, STALE_SECONDS))
 
-cur.execute('SELECT COUNT(*) FROM live_token_features WHERE updated_at >= NOW() - interval \'5 minutes\'')
+cur.execute('''
+SELECT COUNT(*)
+FROM live_token_features
+WHERE updated_at >= NOW() - interval '5 minutes'
+  AND last_seen >= NOW() - (%s || ' seconds')::interval
+''', (STALE_SECONDS,))
+fresh_updated = cur.fetchone()[0]
+
+cur.execute('''
+SELECT COUNT(*)
+FROM live_token_features
+WHERE updated_at >= NOW() - interval '5 minutes'
+''')
 updated = cur.fetchone()[0]
 
 cur.execute('''
-SELECT token_id, mode, snapshots, current_return_pct, max_pump_pct, max_drawdown_pct, buys, sells, traders
+SELECT token_id, mode, snapshots, current_return_pct, max_pump_pct, max_drawdown_pct, buys, sells, traders,
+       EXTRACT(EPOCH FROM (NOW() - last_seen)) AS stale_seconds
 FROM live_token_features
 WHERE updated_at >= NOW() - interval '5 minutes'
+  AND last_seen >= NOW() - (%s || ' seconds')::interval
 ORDER BY ABS(COALESCE(current_return_pct, 0)) DESC
-LIMIT 10
-''')
+LIMIT %s
+''', (STALE_SECONDS, PRINT_LIMIT))
 rows = cur.fetchall()
 
-print(f'live features updated: {updated}', flush=True)
+print(
+    f'live features updated: {updated} fresh={fresh_updated} stale_limit={STALE_SECONDS}s lookback={LOOKBACK_MINUTES}m',
+    flush=True,
+)
 for row in rows:
     print(
-        f'{row[0]} {row[1]} snaps={row[2]} current={row[3]:.2f}% pump={row[4]:.2f}% dd={row[5]:.2f}% buys={row[6]} sells={row[7]} traders={row[8]}',
+        f'{row[0]} {row[1]} snaps={row[2]} current={row[3]:.2f}% pump={row[4]:.2f}% dd={row[5]:.2f}% buys={row[6]} sells={row[7]} traders={row[8]} stale={row[9]:.1f}s',
         flush=True,
     )
