@@ -101,8 +101,8 @@ query ApiProbeTokens($input: PublicTokenListInput!) {
       rank
     }
     meta {
-      cursor
-      hasNextPage
+      endCursor
+      hasNextItems
     }
   }
 }
@@ -172,13 +172,13 @@ def print_token_related_types(by_name):
     print('\nToken/turbo/price related schema types:')
     matches = []
     for name, item in by_name.items():
-        if any(word in name.lower() for word in ('token', 'turbo', 'price', 'stream')):
+        if any(word in name.lower() for word in ('token', 'turbo', 'price', 'stream', 'cursor', 'pagination', 'sort')):
             field_names = [f.get('name') for f in (item.get('fields') or []) if f.get('name')]
             input_names = [f.get('name') for f in (item.get('inputFields') or []) if f.get('name')]
             enum_names = [v.get('name') for v in (item.get('enumValues') or []) if v.get('name')]
             shown = field_names or input_names or enum_names
             matches.append((name, item.get('kind'), shown[:20]))
-    for name, kind, shown in matches[:100]:
+    for name, kind, shown in matches[:120]:
         suffix = ''
         if shown:
             suffix = ' fields=' + ', '.join(shown)
@@ -188,19 +188,37 @@ def print_token_related_types(by_name):
 def try_tokens_examples(headers, by_name):
     input_type = by_name.get('PublicTokenListInput') or {}
     input_fields = [f.get('name') for f in (input_type.get('inputFields') or [])]
+    pagination_type = by_name.get('CursorPaginationInput') or {}
+    pagination_fields = [f.get('name') for f in (pagination_type.get('inputFields') or [])]
+
     print('\nTrying read-only tokens(input: ...) examples')
     print(f'PublicTokenListInput fields: {input_fields}')
+    print(f'CursorPaginationInput fields: {pagination_fields}')
+
+    pagination_candidates = []
+    if 'first' in pagination_fields:
+        pagination_candidates.append({'first': 5})
+    if 'limit' in pagination_fields:
+        pagination_candidates.append({'limit': 5})
+    if 'take' in pagination_fields:
+        pagination_candidates.append({'take': 5})
+    if 'size' in pagination_fields:
+        pagination_candidates.append({'size': 5})
+    if not pagination_candidates:
+        pagination_candidates.append({'first': 5})
 
     candidates = []
-    if 'first' in input_fields:
-        candidates.append({'first': 5})
-    if 'limit' in input_fields:
-        candidates.append({'limit': 5})
-    if 'take' in input_fields:
-        candidates.append({'take': 5})
-    if 'pagination' in input_fields:
-        candidates.append({'pagination': {'first': 5}})
-    candidates.append({})
+    for pagination in pagination_candidates:
+        candidates.append({'pagination': pagination})
+        candidates.append({
+            'pagination': pagination,
+            'sort': {'field': 'StartTime', 'direction': 'Desc'},
+        })
+        candidates.append({
+            'pagination': pagination,
+            'filter': {'rank': 'Public'},
+            'sort': {'field': 'StartTime', 'direction': 'Desc'},
+        })
 
     seen = set()
     unique_candidates = []
@@ -269,10 +287,14 @@ for i, (header_name, header_value) in enumerate(HEADER_CANDIDATES, start=1):
         if type_response.status_code == 200 and not type_data.get('errors'):
             by_name = schema_maps(type_data)
             print_named_type(by_name, 'PublicTokenListInput')
+            print_named_type(by_name, 'CursorPaginationInput')
+            print_named_type(by_name, 'CursorPaginationMetaOutput')
             print_named_type(by_name, 'TurboTokenListFilterInput')
             print_named_type(by_name, 'TurboTokenListSortInput')
             print_named_type(by_name, 'TurboTokenListSorting')
+            print_named_type(by_name, 'SortDirection')
             print_named_type(by_name, 'TurboTokenMode')
+            print_named_type(by_name, 'SpeedMode')
             print_named_type(by_name, 'PublicTokenListOutput')
             print_token_related_types(by_name)
             try_tokens_examples(headers, by_name)
