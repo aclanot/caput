@@ -16,10 +16,11 @@ HEADLESS = os.getenv('HEADLESS', 'false').lower() in ('1', 'true', 'yes', 'on')
 START_URL = os.getenv('START_URL', 'https://catapult.trade/turbo/discover')
 REQUEST_INTERVAL_SECONDS = float(os.getenv('FAST_FINISHED_INTERVAL_SECONDS', '0.30'))
 BATCH_LIMIT = int(os.getenv('FAST_FINISHED_BATCH_LIMIT', '200'))
-READY_DELAY_SECONDS = int(os.getenv('FAST_FINISHED_READY_DELAY_SECONDS', '45'))
+READY_DELAY_SECONDS = int(os.getenv('FAST_FINISHED_READY_DELAY_SECONDS', '90'))
 NOT_READY_COOLDOWN_MINUTES = int(os.getenv('NOT_READY_COOLDOWN_MINUTES', '30'))
 NOT_READY_MAX_RETRIES = int(os.getenv('NOT_READY_MAX_RETRIES', '8'))
 USE_OFFICIAL_READY_QUEUE = os.getenv('FAST_FINISHED_USE_OFFICIAL_READY_QUEUE', 'true').lower() in ('1', 'true', 'yes', 'on')
+ALLOW_SNAPSHOT_FALLBACK = os.getenv('FAST_FINISHED_ALLOW_SNAPSHOT_FALLBACK', 'false').lower() in ('1', 'true', 'yes', 'on')
 
 FAIR_QUERY = '''
 query TurboTokenFairData($tokenId: String!) {
@@ -95,61 +96,58 @@ def log_scan(token_id, status, note=''):
     print(f'fast scan: {token_id} | {status} | {note[:120]}', flush=True)
 
 
-def get_candidate_tokens():
-    has_state = table_exists('official_api_token_state')
+def get_official_ready_tokens():
+    cur.execute('''
+    WITH candidates AS (
+        SELECT
+            s.token_id,
+            s.end_date,
+            s.updated_at,
+            s.mode,
+            s.end_date AS sort_ts
+        FROM official_api_token_state s
+        WHERE s.token_id IS NOT NULL
+          AND s.token_id ~ '^[0-9]+$'
+          AND s.end_date IS NOT NULL
+          AND s.end_date <= NOW() - (%s || ' seconds')::interval
+          AND NOT EXISTS (
+              SELECT 1 FROM finished_tokens ft WHERE ft.token_id = s.token_id
+          )
+    ), retry_state AS (
+        SELECT
+            token_id,
+            COUNT(*) FILTER (WHERE status IN ('not_ready', 'no_fair_data')) AS not_ready_count,
+            MAX(ts) FILTER (WHERE status IN ('not_ready', 'no_fair_data')) AS last_not_ready_ts,
+            COUNT(*) FILTER (WHERE status LIKE 'http_%%' OR status = 'error') AS error_count,
+            MAX(ts) FILTER (WHERE status LIKE 'http_%%' OR status = 'error') AS last_error_ts
+        FROM fast_finished_scan_log
+        GROUP BY token_id
+    )
+    SELECT c.token_id
+    FROM candidates c
+    LEFT JOIN retry_state r ON r.token_id = c.token_id
+    WHERE NOT (
+        COALESCE(r.not_ready_count, 0) >= %s
+        AND COALESCE(r.last_not_ready_ts, TIMESTAMP '1970-01-01') > NOW() - (%s || ' minutes')::interval
+    )
+    AND NOT (
+        COALESCE(r.error_count, 0) >= %s
+        AND COALESCE(r.last_error_ts, TIMESTAMP '1970-01-01') > NOW() - (%s || ' minutes')::interval
+    )
+    ORDER BY c.sort_ts ASC NULLS LAST, c.token_id::BIGINT ASC
+    LIMIT %s
+    ''', (
+        READY_DELAY_SECONDS,
+        NOT_READY_MAX_RETRIES,
+        NOT_READY_COOLDOWN_MINUTES,
+        NOT_READY_MAX_RETRIES,
+        NOT_READY_COOLDOWN_MINUTES,
+        BATCH_LIMIT,
+    ))
+    return [row[0] for row in cur.fetchall()]
 
-    if USE_OFFICIAL_READY_QUEUE and has_state:
-        cur.execute('''
-        WITH candidates AS (
-            SELECT
-                s.token_id,
-                s.end_date,
-                s.updated_at,
-                s.mode,
-                s.end_date AS sort_ts
-            FROM official_api_token_state s
-            WHERE s.token_id IS NOT NULL
-              AND s.token_id ~ '^[0-9]+$'
-              AND s.end_date IS NOT NULL
-              AND s.end_date <= NOW() - (%s || ' seconds')::interval
-              AND NOT EXISTS (
-                  SELECT 1 FROM finished_tokens ft WHERE ft.token_id = s.token_id
-              )
-        ), retry_state AS (
-            SELECT
-                token_id,
-                COUNT(*) FILTER (WHERE status IN ('not_ready', 'no_fair_data')) AS not_ready_count,
-                MAX(ts) FILTER (WHERE status IN ('not_ready', 'no_fair_data')) AS last_not_ready_ts,
-                COUNT(*) FILTER (WHERE status LIKE 'http_%%' OR status = 'error') AS error_count,
-                MAX(ts) FILTER (WHERE status LIKE 'http_%%' OR status = 'error') AS last_error_ts
-            FROM fast_finished_scan_log
-            GROUP BY token_id
-        )
-        SELECT c.token_id
-        FROM candidates c
-        LEFT JOIN retry_state r ON r.token_id = c.token_id
-        WHERE NOT (
-            COALESCE(r.not_ready_count, 0) >= %s
-            AND COALESCE(r.last_not_ready_ts, TIMESTAMP '1970-01-01') > NOW() - (%s || ' minutes')::interval
-        )
-        AND NOT (
-            COALESCE(r.error_count, 0) >= %s
-            AND COALESCE(r.last_error_ts, TIMESTAMP '1970-01-01') > NOW() - (%s || ' minutes')::interval
-        )
-        ORDER BY c.sort_ts DESC NULLS LAST, c.token_id::BIGINT DESC
-        LIMIT %s
-        ''', (
-            READY_DELAY_SECONDS,
-            NOT_READY_MAX_RETRIES,
-            NOT_READY_COOLDOWN_MINUTES,
-            NOT_READY_MAX_RETRIES,
-            NOT_READY_COOLDOWN_MINUTES,
-            BATCH_LIMIT,
-        ))
-        rows = [row[0] for row in cur.fetchall()]
-        if rows:
-            return rows
 
+def get_snapshot_fallback_tokens():
     cur.execute('''
     WITH candidates AS (
         SELECT token_id, MAX(token_id::BIGINT) AS token_num
@@ -189,6 +187,17 @@ def get_candidate_tokens():
         BATCH_LIMIT,
     ))
     return [row[0] for row in cur.fetchall()]
+
+
+def get_candidate_tokens():
+    has_state = table_exists('official_api_token_state')
+
+    if USE_OFFICIAL_READY_QUEUE and has_state:
+        rows = get_official_ready_tokens()
+        if rows or not ALLOW_SNAPSHOT_FALLBACK:
+            return rows
+
+    return get_snapshot_fallback_tokens()
 
 
 def build_payload(token_id):
@@ -263,7 +272,7 @@ def ensure_page(context, page):
 print('fast finished browser collector started', flush=True)
 print(f'profile dir: {Path(LOCAL_PROFILE_DIR).resolve()}', flush=True)
 print(f'headless: {HEADLESS}', flush=True)
-print(f'ready queue: {USE_OFFICIAL_READY_QUEUE} | ready delay: {READY_DELAY_SECONDS}s', flush=True)
+print(f'ready queue: {USE_OFFICIAL_READY_QUEUE} | ready delay: {READY_DELAY_SECONDS}s | snapshot fallback: {ALLOW_SNAPSHOT_FALLBACK}', flush=True)
 print(f'not_ready cooldown: {NOT_READY_MAX_RETRIES} retries / {NOT_READY_COOLDOWN_MINUTES} minutes', flush=True)
 
 with sync_playwright() as p:
