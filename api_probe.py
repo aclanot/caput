@@ -59,6 +59,50 @@ query ApiProbeTypes {
       fields {
         name
       }
+      inputFields {
+        name
+        type {
+          kind
+          name
+          ofType {
+            kind
+            name
+            ofType {
+              kind
+              name
+            }
+          }
+        }
+      }
+      enumValues {
+        name
+      }
+    }
+  }
+}
+'''
+
+TOKENS_QUERY = '''
+query ApiProbeTokens($input: PublicTokenListInput!) {
+  tokens(input: $input) {
+    items {
+      id
+      name
+      symbol
+      speedMode
+      initialPrice
+      price
+      startDate
+      endDate
+      buysCount
+      sellsCount
+      uniqueTradersCount
+      volumeUsdtDrops
+      rank
+    }
+    meta {
+      cursor
+      hasNextPage
     }
   }
 }
@@ -89,10 +133,6 @@ def compact_type(type_obj):
 
 def print_query_fields(data):
     fields = data.get('data', {}).get('__schema', {}).get('queryType', {}).get('fields') or []
-    if not fields:
-        print('No query fields returned by introspection.')
-        return []
-
     print('\nAvailable Query fields:')
     for field in fields:
         args = field.get('args') or []
@@ -104,30 +144,96 @@ def print_query_fields(data):
     return fields
 
 
-def print_token_related_types(data):
-    types = data.get('data', {}).get('__schema', {}).get('types') or []
-    matches = []
-    for type_item in types:
-        name = type_item.get('name') or ''
-        if any(word in name.lower() for word in ('token', 'turbo', 'price', 'stream')):
-            field_names = [f.get('name') for f in (type_item.get('fields') or []) if f.get('name')]
-            matches.append((name, type_item.get('kind'), field_names[:20]))
+def schema_maps(type_data):
+    types = type_data.get('data', {}).get('__schema', {}).get('types') or []
+    by_name = {}
+    for item in types:
+        name = item.get('name')
+        if name:
+            by_name[name] = item
+    return by_name
 
-    print('\nToken/turbo/price related schema types:')
-    if not matches:
-        print('- none found')
+
+def print_named_type(by_name, name):
+    item = by_name.get(name)
+    if not item:
+        print(f'- {name}: not found')
         return
+    print(f'\n{name} [{item.get("kind")}]')
+    for field in item.get('inputFields') or []:
+        print(f"- {field.get('name')}: {compact_type(field.get('type'))}")
+    for value in item.get('enumValues') or []:
+        print(f"- {value.get('name')}")
+    for field in item.get('fields') or []:
+        print(f"- {field.get('name')}")
 
-    for name, kind, field_names in matches[:80]:
+
+def print_token_related_types(by_name):
+    print('\nToken/turbo/price related schema types:')
+    matches = []
+    for name, item in by_name.items():
+        if any(word in name.lower() for word in ('token', 'turbo', 'price', 'stream')):
+            field_names = [f.get('name') for f in (item.get('fields') or []) if f.get('name')]
+            input_names = [f.get('name') for f in (item.get('inputFields') or []) if f.get('name')]
+            enum_names = [v.get('name') for v in (item.get('enumValues') or []) if v.get('name')]
+            shown = field_names or input_names or enum_names
+            matches.append((name, item.get('kind'), shown[:20]))
+    for name, kind, shown in matches[:100]:
         suffix = ''
-        if field_names:
-            suffix = ' fields=' + ', '.join(field_names)
+        if shown:
+            suffix = ' fields=' + ', '.join(shown)
         print(f'- {name} [{kind}]{suffix}')
+
+
+def try_tokens_examples(headers, by_name):
+    input_type = by_name.get('PublicTokenListInput') or {}
+    input_fields = [f.get('name') for f in (input_type.get('inputFields') or [])]
+    print('\nTrying read-only tokens(input: ...) examples')
+    print(f'PublicTokenListInput fields: {input_fields}')
+
+    candidates = []
+    if 'first' in input_fields:
+        candidates.append({'first': 5})
+    if 'limit' in input_fields:
+        candidates.append({'limit': 5})
+    if 'take' in input_fields:
+        candidates.append({'take': 5})
+    if 'pagination' in input_fields:
+        candidates.append({'pagination': {'first': 5}})
+    candidates.append({})
+
+    seen = set()
+    unique_candidates = []
+    for candidate in candidates:
+        key = json.dumps(candidate, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append(candidate)
+
+    for candidate in unique_candidates:
+        print('\ninput candidate:')
+        print(json.dumps(candidate, ensure_ascii=False, indent=2))
+        try:
+            response = post_graphql(
+                headers,
+                TOKENS_QUERY,
+                variables={'input': candidate},
+                operation_name='ApiProbeTokens',
+            )
+            print(f'status={response.status_code}')
+            print(response.text[:3000])
+            data = response.json()
+            if response.status_code == 200 and not data.get('errors'):
+                print('\nSUCCESS: tokens query works with this input')
+                return candidate
+        except Exception as exc:
+            print(f'tokens candidate failed: {exc}')
+    return None
 
 
 print(f'API_URL={API_URL}')
 print(f'TOKEN_ID={TOKEN_ID}')
-print('This probe is read-only. It only uses GraphQL introspection and does not call trading mutations.')
+print('This probe is read-only. It uses GraphQL introspection and tokens query only.')
 
 for i, (header_name, header_value) in enumerate(HEADER_CANDIDATES, start=1):
     headers = {
@@ -158,13 +264,21 @@ for i, (header_name, header_value) in enumerate(HEADER_CANDIDATES, start=1):
         print('\nSUCCESS: this auth header can access schema introspection')
         print_query_fields(data)
 
-        try:
-            type_response = post_graphql(headers, TYPE_QUERY, operation_name='ApiProbeTypes')
-            type_data = type_response.json()
-            if type_response.status_code == 200 and not type_data.get('errors'):
-                print_token_related_types(type_data)
-        except Exception as exc:
-            print(f'type introspection skipped: {exc}')
+        type_response = post_graphql(headers, TYPE_QUERY, operation_name='ApiProbeTypes')
+        type_data = type_response.json()
+        if type_response.status_code == 200 and not type_data.get('errors'):
+            by_name = schema_maps(type_data)
+            print_named_type(by_name, 'PublicTokenListInput')
+            print_named_type(by_name, 'TurboTokenListFilterInput')
+            print_named_type(by_name, 'TurboTokenListSortInput')
+            print_named_type(by_name, 'TurboTokenListSorting')
+            print_named_type(by_name, 'TurboTokenMode')
+            print_named_type(by_name, 'PublicTokenListOutput')
+            print_token_related_types(by_name)
+            try_tokens_examples(headers, by_name)
+        else:
+            print('Type introspection failed:')
+            print(type_response.text[:2000])
         break
 
     errors = data.get('errors') if isinstance(data, dict) else None
