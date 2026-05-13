@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import psycopg
 import requests
@@ -26,9 +26,18 @@ conn.autocommit = True
 cur = conn.cursor()
 
 
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def ensure_schema():
     cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS sent_to_telegram BOOLEAN DEFAULT FALSE')
     cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT')
+    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_name TEXT')
+    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_risk TEXT')
+    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reversal_from_peak_pct DOUBLE PRECISION')
+    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS max_pump_pct DOUBLE PRECISION')
+    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS live_snapshots INT')
     cur.execute('ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS result_sent_to_telegram BOOLEAN DEFAULT FALSE')
 
 
@@ -58,24 +67,11 @@ def fmt_price(value):
 
 def signal_message(row):
     (
-        signal_id,
-        token_id,
-        mode,
-        side,
-        confidence_pct,
-        current_price,
-        entry_low,
-        entry_high,
-        take_profit_price,
-        stop_loss_price,
-        max_leverage,
-        matched_strategy,
-        historical_trades,
-        historical_winrate,
-        historical_avg_pnl,
-        historical_median_pnl,
-        historical_worst_pnl,
-        current_return_pct,
+        signal_id, token_id, mode, side, confidence_pct,
+        current_price, entry_low, entry_high, take_profit_price, stop_loss_price,
+        max_leverage, matched_strategy, historical_trades, historical_winrate,
+        historical_avg_pnl, historical_median_pnl, historical_worst_pnl, current_return_pct,
+        cluster_name, cluster_risk, reversal_from_peak_pct, max_pump_pct, live_snapshots,
     ) = row
 
     token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
@@ -87,6 +83,11 @@ def signal_message(row):
         f'Mode: {mode}\n'
         f'Confidence: {confidence_pct}%\n'
         f'Max leverage: x{max_leverage:g}\n\n'
+        f'Cluster: {cluster_name or "n/a"}\n'
+        f'Cluster risk: {cluster_risk or "n/a"}\n'
+        f'Snapshots: {live_snapshots or 0}\n'
+        f'Max pump: {(max_pump_pct or 0):.2f}%\n'
+        f'Reversal from peak: {(reversal_from_peak_pct or 0):.2f}%\n\n'
         f'Current price: {fmt_price(current_price)}\n'
         f'Entry: {fmt_price(entry_low)} - {fmt_price(entry_high)}\n'
         f'Take profit: {fmt_price(take_profit_price)}\n'
@@ -109,7 +110,8 @@ def broadcast_new_signals():
         id, token_id, mode, side, confidence_pct,
         current_price, entry_low, entry_high, take_profit_price, stop_loss_price,
         max_leverage, matched_strategy, historical_trades, historical_winrate,
-        historical_avg_pnl, historical_median_pnl, historical_worst_pnl, current_return_pct
+        historical_avg_pnl, historical_median_pnl, historical_worst_pnl, current_return_pct,
+        cluster_name, cluster_risk, reversal_from_peak_pct, max_pump_pct, live_snapshots
     FROM live_signals
     WHERE COALESCE(sent_to_telegram, false) = false
       AND created_at >= NOW() - (%s || ' minutes')::interval
@@ -137,16 +139,9 @@ def broadcast_new_signals():
 def update_open_paper_trades():
     cur.execute('''
     SELECT
-        pst.id,
-        pst.signal_id,
-        pst.token_id,
-        pst.side,
-        pst.entry_price,
-        pst.take_profit_price,
-        pst.stop_loss_price,
-        pst.max_leverage,
-        pst.opened_at,
-        ltf.current_price
+        pst.id, pst.signal_id, pst.token_id, pst.side,
+        pst.entry_price, pst.take_profit_price, pst.stop_loss_price,
+        pst.max_leverage, pst.opened_at, ltf.current_price
     FROM paper_signal_trades pst
     LEFT JOIN live_token_features ltf ON ltf.token_id = pst.token_id
     WHERE pst.status = 'OPEN'
@@ -157,19 +152,7 @@ def update_open_paper_trades():
     rows = cur.fetchall()
     closed = 0
     for row in rows:
-        (
-            trade_id,
-            signal_id,
-            token_id,
-            side,
-            entry_price,
-            tp,
-            sl,
-            max_leverage,
-            opened_at,
-            current_price,
-        ) = row
-
+        trade_id, signal_id, token_id, side, entry_price, tp, sl, max_leverage, opened_at, current_price = row
         if current_price is None or entry_price is None or entry_price <= 0:
             continue
 
@@ -195,10 +178,9 @@ def update_open_paper_trades():
         UPDATE paper_signal_trades
         SET status = 'CLOSED', closed_at = %s, close_price = %s, pnl_pct = %s, close_reason = %s
         WHERE id = %s
-        ''', (datetime.utcnow(), current_price, leveraged_pnl, close_reason, trade_id))
+        ''', (utcnow(), current_price, leveraged_pnl, close_reason, trade_id))
         closed += 1
         print(f'closed paper trade {trade_id} {close_reason} pnl={leveraged_pnl:.2f}%', flush=True)
-
     return closed
 
 
@@ -207,8 +189,9 @@ def send_closed_trade_results():
     SELECT
         pst.id, pst.signal_id, pst.token_id, pst.mode, pst.side, pst.confidence_pct,
         pst.entry_price, pst.close_price, pst.pnl_pct, pst.close_reason, pst.max_leverage,
-        pst.opened_at, pst.closed_at
+        pst.opened_at, pst.closed_at, ls.cluster_name, ls.reversal_from_peak_pct
     FROM paper_signal_trades pst
+    LEFT JOIN live_signals ls ON ls.id = pst.signal_id
     WHERE pst.status = 'CLOSED'
       AND COALESCE(pst.result_sent_to_telegram, false) = false
     ORDER BY pst.closed_at ASC
@@ -218,19 +201,9 @@ def send_closed_trade_results():
     sent = 0
     for row in rows:
         (
-            trade_id,
-            signal_id,
-            token_id,
-            mode,
-            side,
-            confidence_pct,
-            entry_price,
-            close_price,
-            pnl_pct,
-            close_reason,
-            max_leverage,
-            opened_at,
-            closed_at,
+            trade_id, signal_id, token_id, mode, side, confidence_pct,
+            entry_price, close_price, pnl_pct, close_reason, max_leverage,
+            opened_at, closed_at, cluster_name, reversal_from_peak_pct,
         ) = row
 
         token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
@@ -242,6 +215,8 @@ def send_closed_trade_results():
             f'Type: {side}\n'
             f'Mode: {mode}\n'
             f'Confidence: {confidence_pct}%\n'
+            f'Cluster: {cluster_name or "n/a"}\n'
+            f'Reversal from peak: {(reversal_from_peak_pct or 0):.2f}%\n'
             f'Leverage: x{max_leverage:g}\n\n'
             f'Entry: {fmt_price(entry_price)}\n'
             f'Close: {fmt_price(close_price)}\n'
