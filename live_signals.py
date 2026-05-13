@@ -7,10 +7,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL')
-MIN_SIGNAL_TRADES = int(os.getenv('LIVE_SIGNALS_MIN_TRADES', '20'))
-MIN_SIGNAL_WINRATE = float(os.getenv('LIVE_SIGNALS_MIN_WINRATE', '0.50'))
+MIN_SIGNAL_TRADES = int(os.getenv('LIVE_SIGNALS_MIN_TRADES', '50'))
+MIN_SIGNAL_WINRATE = float(os.getenv('LIVE_SIGNALS_MIN_WINRATE', '0.55'))
 MIN_SIGNAL_EXPECTANCY = float(os.getenv('LIVE_SIGNALS_MIN_EXPECTANCY', '5'))
 MAX_SIGNAL_AGE_SECONDS = float(os.getenv('LIVE_SIGNALS_MAX_AGE_SECONDS', '300'))
+MIN_SIGNAL_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_MIN_CONFIDENCE', '60'))
+DEFAULT_SHORT_TP_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_TP_PCT', '30'))
+DEFAULT_SHORT_SL_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_SL_PCT', '35'))
+DEFAULT_LONG_TP_PCT = float(os.getenv('LIVE_SIGNAL_LONG_TP_PCT', '20'))
+DEFAULT_LONG_SL_PCT = float(os.getenv('LIVE_SIGNAL_LONG_SL_PCT', '25'))
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -27,6 +32,13 @@ CREATE TABLE IF NOT EXISTS live_signals (
     side TEXT,
     signal_type TEXT,
     confidence TEXT,
+    confidence_pct INT,
+    current_price DOUBLE PRECISION,
+    entry_low DOUBLE PRECISION,
+    entry_high DOUBLE PRECISION,
+    take_profit_price DOUBLE PRECISION,
+    stop_loss_price DOUBLE PRECISION,
+    max_leverage DOUBLE PRECISION,
     current_return_pct DOUBLE PRECISION,
     matched_strategy TEXT,
     historical_trades INT,
@@ -35,16 +47,108 @@ CREATE TABLE IF NOT EXISTS live_signals (
     historical_median_pnl DOUBLE PRECISION,
     historical_worst_pnl DOUBLE PRECISION,
     reason TEXT,
+    sent_to_telegram BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP
+)
+''')
+
+cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS confidence_pct INT')
+cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS current_price DOUBLE PRECISION')
+cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS entry_low DOUBLE PRECISION')
+cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS entry_high DOUBLE PRECISION')
+cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS take_profit_price DOUBLE PRECISION')
+cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS stop_loss_price DOUBLE PRECISION')
+cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS max_leverage DOUBLE PRECISION')
+cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS sent_to_telegram BOOLEAN DEFAULT FALSE')
+
+cur.execute('''
+CREATE TABLE IF NOT EXISTS paper_signal_trades (
+    id BIGSERIAL PRIMARY KEY,
+    signal_id BIGINT UNIQUE,
+    token_id TEXT,
+    mode TEXT,
+    side TEXT,
+    status TEXT,
+    confidence_pct INT,
+    entry_price DOUBLE PRECISION,
+    take_profit_price DOUBLE PRECISION,
+    stop_loss_price DOUBLE PRECISION,
+    max_leverage DOUBLE PRECISION,
+    opened_at TIMESTAMP,
+    closed_at TIMESTAMP,
+    close_price DOUBLE PRECISION,
+    pnl_pct DOUBLE PRECISION,
+    close_reason TEXT
 )
 ''')
 
 cur.execute('DELETE FROM live_signals WHERE created_at < NOW() - interval \'1 day\'')
 
+
+def clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+def confidence_score(winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side):
+    score = 40
+    score += (winrate - 0.50) * 140
+    score += min(max(avg_pnl, 0), 80) * 0.25
+    score += min(max(median_pnl, -50), 80) * 0.15
+    score += min(trades, 3000) / 3000 * 10
+
+    if worst_pnl is not None and worst_pnl < -70:
+        score -= 8
+    if mode == 'CRACK' and side == 'SHORT':
+        score += 7
+    if mode == 'FLASH' and side == 'SHORT':
+        score += 4
+    if mode in ('MAYHEM', 'UNKNOWN'):
+        score -= 5
+
+    return int(round(clamp(score, 1, 99)))
+
+
+def confidence_label(confidence_pct):
+    if confidence_pct >= 80:
+        return 'HIGH'
+    if confidence_pct >= 65:
+        return 'MEDIUM'
+    return 'LOW'
+
+
+def max_leverage_for(confidence_pct, mode, side):
+    # Paper-only recommendation. Keep conservative until live robustness is proven.
+    if side != 'SHORT':
+        return 1.0
+    if mode == 'CRACK' and confidence_pct >= 85:
+        return 2.0
+    if mode in ('CRACK', 'FLASH') and confidence_pct >= 75:
+        return 1.5
+    return 1.0
+
+
+def prices_for_signal(side, current_price):
+    if current_price is None or current_price <= 0:
+        return None, None, None, None
+
+    entry_low = current_price * 0.98
+    entry_high = current_price * 1.02
+
+    if side == 'SHORT':
+        tp = current_price * (1.0 - DEFAULT_SHORT_TP_PCT / 100.0)
+        sl = current_price * (1.0 + DEFAULT_SHORT_SL_PCT / 100.0)
+    else:
+        tp = current_price * (1.0 + DEFAULT_LONG_TP_PCT / 100.0)
+        sl = current_price * (1.0 - DEFAULT_LONG_SL_PCT / 100.0)
+
+    return entry_low, entry_high, tp, sl
+
+
 cur.execute('''
 SELECT
     lf.token_id,
     lf.mode,
+    lf.current_price,
     lf.current_return_pct,
     lf.max_pump_pct,
     lf.max_drawdown_pct,
@@ -70,6 +174,7 @@ WHERE lf.age_seconds <= %s
   AND ss.trades >= %s
   AND ss.winrate >= %s
   AND ss.avg_pnl >= %s
+  AND ss.side = 'SHORT'
 ''', (
     MAX_SIGNAL_AGE_SECONDS,
     MIN_SIGNAL_TRADES,
@@ -84,6 +189,7 @@ for row in rows:
     (
         token_id,
         mode,
+        current_price,
         current_return_pct,
         max_pump_pct,
         max_drawdown_pct,
@@ -104,65 +210,66 @@ for row in rows:
         worst_pnl,
     ) = row
 
-    matched = False
+    if current_return_pct is None or current_price is None:
+        continue
 
-    if side == 'SHORT' and current_return_pct is not None:
-        threshold_pct = (entry_threshold - 1.0) * 100.0
-        if current_return_pct >= threshold_pct:
-            matched = True
+    threshold_pct = (entry_threshold - 1.0) * 100.0
+    if current_return_pct < threshold_pct:
+        continue
 
-    if side == 'LONG' and current_return_pct is not None:
-        drawdown_pct = (1.0 - entry_threshold) * 100.0
-        if current_return_pct <= -drawdown_pct:
-            matched = True
-
-    if not matched:
+    conf_pct = confidence_score(winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side)
+    if conf_pct < MIN_SIGNAL_CONFIDENCE:
         continue
 
     cur.execute('''
     SELECT 1
     FROM live_signals
     WHERE token_id = %s
-      AND matched_strategy = %s
+      AND side = %s
       AND created_at >= NOW() - interval '30 minutes'
     LIMIT 1
-    ''', (token_id, strategy))
+    ''', (token_id, side))
 
     if cur.fetchone():
         continue
 
-    confidence = 'LOW'
-    if winrate >= 0.60 and avg_pnl >= 15:
-        confidence = 'MEDIUM'
-    if winrate >= 0.65 and avg_pnl >= 25:
-        confidence = 'HIGH'
+    entry_low, entry_high, tp_price, sl_price = prices_for_signal(side, current_price)
+    max_lev = max_leverage_for(conf_pct, mode, side)
+    conf_label = confidence_label(conf_pct)
+    signal_type = f'{side}_SIGNAL'
 
-    signal_type = f'{side}_WATCH'
-
+    url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
     reason = (
-        f'{mode} matched {strategy} | '
-        f'current={current_return_pct:.2f}% | '
-        f'winrate={winrate*100:.1f}% | '
-        f'avg={avg_pnl:.2f}% | '
-        f'median={median_pnl:.2f}% | '
-        f'worst={worst_pnl:.2f}%'
+        f'{mode} matched {strategy} | current={current_return_pct:.2f}% | '
+        f'historical winrate={winrate*100:.1f}% | avg={avg_pnl:.2f}% | '
+        f'median={median_pnl:.2f}% | worst={worst_pnl:.2f}% | '
+        f'trades={trades} | url={url}'
     )
 
     cur.execute('''
     INSERT INTO live_signals(
-        token_id, mode, side, signal_type, confidence,
+        token_id, mode, side, signal_type, confidence, confidence_pct,
+        current_price, entry_low, entry_high, take_profit_price, stop_loss_price, max_leverage,
         current_return_pct, matched_strategy,
         historical_trades, historical_winrate,
         historical_avg_pnl, historical_median_pnl,
         historical_worst_pnl,
         reason, created_at
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    RETURNING id
     ''', (
         token_id,
         mode,
         side,
         signal_type,
-        confidence,
+        conf_label,
+        conf_pct,
+        current_price,
+        entry_low,
+        entry_high,
+        tp_price,
+        sl_price,
+        max_lev,
         current_return_pct,
         strategy,
         trades,
@@ -171,6 +278,26 @@ for row in rows:
         median_pnl,
         worst_pnl,
         reason,
+        datetime.utcnow(),
+    ))
+    signal_id = cur.fetchone()[0]
+
+    cur.execute('''
+    INSERT INTO paper_signal_trades(
+        signal_id, token_id, mode, side, status, confidence_pct,
+        entry_price, take_profit_price, stop_loss_price, max_leverage, opened_at
+    ) VALUES (%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s)
+    ON CONFLICT(signal_id) DO NOTHING
+    ''', (
+        signal_id,
+        token_id,
+        mode,
+        side,
+        conf_pct,
+        current_price,
+        tp_price,
+        sl_price,
+        max_lev,
         datetime.utcnow(),
     ))
 
@@ -182,9 +309,14 @@ cur.execute('''
 SELECT
     token_id,
     mode,
-    signal_type,
-    confidence,
-    current_return_pct,
+    side,
+    confidence_pct,
+    current_price,
+    entry_low,
+    entry_high,
+    take_profit_price,
+    stop_loss_price,
+    max_leverage,
     matched_strategy,
     historical_winrate,
     historical_avg_pnl
@@ -195,6 +327,6 @@ LIMIT 20
 
 for row in cur.fetchall():
     print(
-        f'{row[0]} {row[1]} {row[2]} {row[3]} current={row[4]:.2f}% strategy={row[5]} win={row[6]*100:.1f}% avg={row[7]:.2f}%',
+        f'{row[0]} {row[1]} {row[2]} conf={row[3]}% price={row[4]:.6f} entry={row[5]:.6f}-{row[6]:.6f} tp={row[7]:.6f} sl={row[8]:.6f} lev=x{row[9]} strategy={row[10]} win={row[11]*100:.1f}% avg={row[12]:.2f}%',
         flush=True,
     )
