@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import psycopg
 import requests
@@ -19,6 +19,7 @@ API_SORT_FIELD = os.getenv('API_COLLECTOR_SORT_FIELD', 'StartTime').strip()
 API_SORT_DIRECTION = os.getenv('API_COLLECTOR_SORT_DIRECTION', 'Desc').strip()
 API_PAGES_PER_CYCLE = int(os.getenv('API_COLLECTOR_PAGES_PER_CYCLE', '3'))
 API_PAGE_SLEEP_SECONDS = float(os.getenv('API_COLLECTOR_PAGE_SLEEP_SECONDS', '0.2'))
+API_SAVE_RAW = os.getenv('API_COLLECTOR_SAVE_RAW', 'false').lower() in ('1', 'true', 'yes', 'on')
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -118,7 +119,7 @@ cur.execute('CREATE INDEX IF NOT EXISTS idx_official_api_token_state_updated_at 
 
 
 def utcnow():
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def parse_api_datetime(value):
@@ -181,7 +182,7 @@ def fetch_tokens(after_cursor=None):
         'operationName': 'OfficialApiTokens',
         'variables': {'input': build_input(after_cursor=after_cursor)},
     }
-    return requests.post(API_URL, headers=headers, json=payload, timeout=30)
+    return requests.post(API_URL, headers=headers, json=payload, timeout=15)
 
 
 def save_items(items):
@@ -240,10 +241,11 @@ def save_items(items):
             ),
         )
 
-        cur.execute(
-            'INSERT INTO official_api_tokens_raw(ts, token_id, response) VALUES (%s,%s,%s)',
-            (now, token_id, json.dumps(item)),
-        )
+        if API_SAVE_RAW:
+            cur.execute(
+                'INSERT INTO official_api_tokens_raw(ts, token_id, response) VALUES (%s,%s,%s)',
+                (now, token_id, json.dumps(item)),
+            )
         saved += 1
     return saved
 
@@ -290,6 +292,7 @@ def main():
     print(f'API_URL={API_URL}', flush=True)
     print(f'interval={API_INTERVAL_SECONDS}s limit={API_LIMIT} pages={API_PAGES_PER_CYCLE}', flush=True)
     print(f'sort={API_SORT_FIELD} {API_SORT_DIRECTION} speed_mode={API_SPEED_MODE or "ALL"}', flush=True)
+    print(f'raw save={API_SAVE_RAW}', flush=True)
     print('read-only: tokens query only, no mutations', flush=True)
 
     while True:
