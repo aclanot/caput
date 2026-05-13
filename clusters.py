@@ -1,6 +1,6 @@
 import os
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 import psycopg
 from dotenv import load_dotenv
@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS cluster_summary (
 cur.execute('DELETE FROM cluster_summary')
 
 
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def classify_cluster(final_ret, max_pump, max_dd, pump_fail, bounce):
     if max_pump >= 500 and final_ret >= 100:
         return 'mega_pump', 'huge pump and strong close'
@@ -73,6 +77,7 @@ rows = cur.fetchall()
 
 summary = defaultdict(list)
 processed = 0
+now = utcnow()
 
 for row in rows:
     token_id, mode, final_ret, max_pump, max_dd, pump_fail, bounce = row
@@ -90,10 +95,32 @@ for row in rows:
         max_pump_pct = EXCLUDED.max_pump_pct,
         max_drawdown_pct = EXCLUDED.max_drawdown_pct,
         updated_at = EXCLUDED.updated_at
-    ''', (str(token_id), mode, cluster_name, reason, final_ret, max_pump, max_dd, datetime.utcnow()))
+    ''', (str(token_id), mode, cluster_name, reason, final_ret, max_pump, max_dd, now))
     summary[(cluster_name, mode)].append((final_ret, max_pump, max_dd, pump_fail))
     processed += 1
 
+for (cluster_name, mode), values in summary.items():
+    n = len(values)
+    avg_final = sum(v[0] for v in values) / n
+    avg_pump = sum(v[1] for v in values) / n
+    avg_dd = sum(v[2] for v in values) / n
+    p_down = sum(1 for v in values if v[0] < 0) / n
+    p_pump_fail = sum(1 for v in values if v[3]) / n
+    cur.execute('''
+    INSERT INTO cluster_summary(
+        cluster_name, mode, tokens, avg_final_return_pct, avg_max_pump_pct,
+        avg_max_drawdown_pct, p_final_below_start, p_pump30_dump20, updated_at
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT(cluster_name, mode) DO UPDATE SET
+        tokens = EXCLUDED.tokens,
+        avg_final_return_pct = EXCLUDED.avg_final_return_pct,
+        avg_max_pump_pct = EXCLUDED.avg_max_pump_pct,
+        avg_max_drawdown_pct = EXCLUDED.avg_max_drawdown_pct,
+        p_final_below_start = EXCLUDED.p_final_below_start,
+        p_pump30_dump20 = EXCLUDED.p_pump30_dump20,
+        updated_at = EXCLUDED.updated_at
+    ''', (cluster_name, mode, n, avg_final, avg_pump, avg_dd, p_down, p_pump_fail, now))
+
 print(f'clustered trajectories: {processed}')
 print(f'cluster groups prepared: {len(summary)}')
-print(f'clusters completed at {datetime.utcnow()} UTC')
+print(f'clusters completed at {utcnow()} UTC')
