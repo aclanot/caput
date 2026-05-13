@@ -1,6 +1,8 @@
 import csv
 import io
 import os
+import zipfile
+from datetime import UTC, datetime
 
 import psycopg
 from telegram import Update
@@ -8,14 +10,73 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 DATABASE_URL = os.getenv('DATABASE_URL')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+BACKUP_MAX_ROWS_PER_TABLE = int(os.getenv('BACKUP_MAX_ROWS_PER_TABLE', '0'))
+BACKUP_INCLUDE_SNAPSHOTS = os.getenv('BACKUP_INCLUDE_SNAPSHOTS', 'true').lower() in ('1', 'true', 'yes', 'on')
 
 conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
+
+BACKUP_TABLES = [
+    'finished_tokens',
+    'trajectory_features',
+    'paper_trades',
+    'strategy_sweep',
+    'trajectory_clusters',
+    'official_api_token_state',
+    'token_snapshots',
+    'live_token_features',
+    'live_signals',
+]
 
 
 def table_exists(cur, table_name):
     cur.execute('SELECT to_regclass(%s)', (f'public.{table_name}',))
     return cur.fetchone()[0] is not None
+
+
+def safe_identifier(name):
+    if not name.replace('_', '').isalnum():
+        raise ValueError(f'unsafe table name: {name}')
+    return name
+
+
+def utc_stamp():
+    return datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
+
+
+def write_table_csv_to_zip(cur, zip_file, table_name):
+    table_name = safe_identifier(table_name)
+    if not table_exists(cur, table_name):
+        return 0
+
+    if table_name == 'token_snapshots' and not BACKUP_INCLUDE_SNAPSHOTS:
+        return 0
+
+    cur.execute('''
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = %s
+        ORDER BY ordinal_position
+    ''', (table_name,))
+    columns = [row[0] for row in cur.fetchall()]
+    if not columns:
+        return 0
+
+    sql = f'SELECT * FROM {table_name}'
+    if BACKUP_MAX_ROWS_PER_TABLE > 0:
+        order_col = 'id' if 'id' in columns else columns[0]
+        sql += f' ORDER BY {order_col} DESC LIMIT %s'
+        cur.execute(sql, (BACKUP_MAX_ROWS_PER_TABLE,))
+    else:
+        cur.execute(sql)
+
+    rows = cur.fetchall()
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(columns)
+    writer.writerows(rows)
+    zip_file.writestr(f'{table_name}.csv', csv_buffer.getvalue())
+    return len(rows)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -26,6 +87,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '/paper - paper simulation summary\n'
         '/sweep - top optimized parameter sets\n'
         '/latest - latest saved trajectories\n'
+        '/backup - export DB backup ZIP\n'
         '/export - export finished trajectories CSV\n'
         '/export_features - export analysis features CSV\n'
         '/export_sweep - export sweep results CSV'
@@ -62,15 +124,21 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute('SELECT COUNT(*) FROM strategy_sweep')
         sweep_count = cur.fetchone()[0]
 
+    state_count = 0
+    if table_exists(cur, 'official_api_token_state'):
+        cur.execute('SELECT COUNT(*) FROM official_api_token_state')
+        state_count = cur.fetchone()[0]
+
     text = (
         'Status\n\n'
         f'Finished trajectories: {finished}\n'
         f'Live snapshots: {snapshots}\n'
+        f'Official token states: {state_count}\n'
         f'Analysis rows: {features}\n'
         f'Paper simulation trades: {paper}\n'
         f'Sweep rows: {sweep_count}\n'
         f'Last snapshot: {last_snapshot}\n\n'
-        'Run order: collector -> finished collector -> analyze.py -> paper_sim.py -> sweep.py'
+        'Run order: official_api_collector -> fast_finished_collector -> auto_run.py -> clusters.py'
     )
     await update.message.reply_text(text)
 
@@ -225,6 +293,36 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text[:4000])
 
 
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    await update.message.reply_text('Creating backup ZIP...')
+
+    zip_buffer = io.BytesIO()
+    manifest_lines = [
+        'caput backup',
+        f'created_utc={datetime.now(UTC).isoformat()}',
+        f'backup_max_rows_per_table={BACKUP_MAX_ROWS_PER_TABLE}',
+        f'backup_include_snapshots={BACKUP_INCLUDE_SNAPSHOTS}',
+        '',
+        'tables:',
+    ]
+
+    with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+        for table_name in BACKUP_TABLES:
+            try:
+                row_count = write_table_csv_to_zip(cur, zf, table_name)
+                if row_count:
+                    manifest_lines.append(f'- {table_name}: {row_count} rows')
+            except Exception as exc:
+                manifest_lines.append(f'- {table_name}: ERROR {exc}')
+
+        zf.writestr('MANIFEST.txt', '\n'.join(manifest_lines) + '\n')
+
+    zip_buffer.seek(0)
+    filename = f'caput_backup_{utc_stamp()}.zip'
+    await update.message.reply_document(document=zip_buffer, filename=filename)
+
+
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     cur.execute('SELECT token_id, ts, salt, ticks::text FROM finished_tokens ORDER BY ts DESC LIMIT 2000')
@@ -306,6 +404,7 @@ app.add_handler(CommandHandler('summary', summary))
 app.add_handler(CommandHandler('paper', paper))
 app.add_handler(CommandHandler('sweep', sweep))
 app.add_handler(CommandHandler('latest', latest))
+app.add_handler(CommandHandler('backup', backup))
 app.add_handler(CommandHandler('export', export))
 app.add_handler(CommandHandler('export_features', export_features))
 app.add_handler(CommandHandler('export_sweep', export_sweep))
