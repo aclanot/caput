@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import psycopg
 from dotenv import load_dotenv
@@ -12,6 +12,10 @@ MIN_SIGNAL_WINRATE = float(os.getenv('LIVE_SIGNALS_MIN_WINRATE', '0.55'))
 MIN_SIGNAL_EXPECTANCY = float(os.getenv('LIVE_SIGNALS_MIN_EXPECTANCY', '5'))
 MAX_SIGNAL_AGE_SECONDS = float(os.getenv('LIVE_SIGNALS_MAX_AGE_SECONDS', '300'))
 MIN_SIGNAL_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_MIN_CONFIDENCE', '60'))
+MIN_REVERSAL_FROM_PEAK_PCT = float(os.getenv('LIVE_SIGNALS_MIN_REVERSAL_FROM_PEAK_PCT', '20'))
+MIN_PUMP_FOR_REVERSAL_PCT = float(os.getenv('LIVE_SIGNALS_MIN_PUMP_FOR_REVERSAL_PCT', '50'))
+MIN_LIVE_SNAPSHOTS_FOR_SIGNAL = int(os.getenv('LIVE_SIGNALS_MIN_SNAPSHOTS', '3'))
+ALLOW_NO_REVERSAL_FOR_CRACK = os.getenv('LIVE_SIGNALS_ALLOW_NO_REVERSAL_FOR_CRACK', 'false').lower() in ('1', 'true', 'yes', 'on')
 DEFAULT_SHORT_TP_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_TP_PCT', '30'))
 DEFAULT_SHORT_SL_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_SL_PCT', '35'))
 DEFAULT_LONG_TP_PCT = float(os.getenv('LIVE_SIGNAL_LONG_TP_PCT', '20'))
@@ -23,6 +27,11 @@ if not DATABASE_URL:
 conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 cur = conn.cursor()
+
+
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 cur.execute('''
 CREATE TABLE IF NOT EXISTS live_signals (
@@ -52,14 +61,22 @@ CREATE TABLE IF NOT EXISTS live_signals (
 )
 ''')
 
-cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS confidence_pct INT')
-cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS current_price DOUBLE PRECISION')
-cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS entry_low DOUBLE PRECISION')
-cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS entry_high DOUBLE PRECISION')
-cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS take_profit_price DOUBLE PRECISION')
-cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS stop_loss_price DOUBLE PRECISION')
-cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS max_leverage DOUBLE PRECISION')
-cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS sent_to_telegram BOOLEAN DEFAULT FALSE')
+for ddl in [
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS confidence_pct INT',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS current_price DOUBLE PRECISION',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS entry_low DOUBLE PRECISION',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS entry_high DOUBLE PRECISION',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS take_profit_price DOUBLE PRECISION',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS stop_loss_price DOUBLE PRECISION',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS max_leverage DOUBLE PRECISION',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS sent_to_telegram BOOLEAN DEFAULT FALSE',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS live_snapshots INT',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS max_pump_pct DOUBLE PRECISION',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reversal_from_peak_pct DOUBLE PRECISION',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_name TEXT',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_risk TEXT',
+]:
+    cur.execute(ddl)
 
 cur.execute('''
 CREATE TABLE IF NOT EXISTS paper_signal_trades (
@@ -82,19 +99,63 @@ CREATE TABLE IF NOT EXISTS paper_signal_trades (
 )
 ''')
 
+cur.execute('''
+CREATE TABLE IF NOT EXISTS signal_debug_log (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMP,
+    token_id TEXT,
+    mode TEXT,
+    status TEXT,
+    note TEXT
+)
+''')
+
 cur.execute('DELETE FROM live_signals WHERE created_at < NOW() - interval \'1 day\'')
+
+
+def table_exists(table_name):
+    cur.execute('SELECT to_regclass(%s)', (f'public.{table_name}',))
+    return cur.fetchone()[0] is not None
 
 
 def clamp(value, lo, hi):
     return max(lo, min(hi, value))
 
 
-def confidence_score(winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side):
+def classify_live_cluster(current_return_pct, max_pump_pct, max_drawdown_pct, reversal_from_peak_pct, buy_sell_ratio, snapshots):
+    if max_pump_pct is None:
+        return 'unknown_live', 'UNKNOWN'
+    if max_pump_pct >= 500 and reversal_from_peak_pct < 15:
+        return 'mega_runner_live', 'DANGEROUS_SHORT'
+    if max_pump_pct >= 150 and reversal_from_peak_pct < 10:
+        return 'strong_continuation_live', 'DANGEROUS_SHORT'
+    if max_pump_pct >= 50 and reversal_from_peak_pct >= 35:
+        return 'pump_reversal_live', 'GOOD_SHORT'
+    if max_pump_pct >= 100 and reversal_from_peak_pct >= 20:
+        return 'pump_exhaustion_live', 'GOOD_SHORT'
+    if max_pump_pct >= 50 and buy_sell_ratio is not None and buy_sell_ratio < 1.2 and snapshots >= 3:
+        return 'weak_buy_pressure_live', 'OK_SHORT'
+    return 'mixed_live', 'NEUTRAL'
+
+
+def cluster_adjustment(cluster_name, cluster_risk):
+    if cluster_risk == 'GOOD_SHORT':
+        return 12
+    if cluster_risk == 'OK_SHORT':
+        return 5
+    if cluster_risk == 'DANGEROUS_SHORT':
+        return -30
+    return 0
+
+
+def confidence_score(winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side, cluster_name, cluster_risk, reversal_from_peak_pct):
     score = 40
     score += (winrate - 0.50) * 140
-    score += min(max(avg_pnl, 0), 80) * 0.25
-    score += min(max(median_pnl, -50), 80) * 0.15
-    score += min(trades, 3000) / 3000 * 10
+    score += min(max(avg_pnl or 0, 0), 80) * 0.25
+    score += min(max(median_pnl or 0, -50), 80) * 0.15
+    score += min(trades or 0, 3000) / 3000 * 10
+    score += min(max(reversal_from_peak_pct or 0, 0), 80) * 0.20
+    score += cluster_adjustment(cluster_name, cluster_risk)
 
     if worst_pnl is not None and worst_pnl < -70:
         score -= 8
@@ -116,10 +177,11 @@ def confidence_label(confidence_pct):
     return 'LOW'
 
 
-def max_leverage_for(confidence_pct, mode, side):
-    # Paper-only recommendation. Keep conservative until live robustness is proven.
+def max_leverage_for(confidence_pct, mode, side, cluster_risk):
     if side != 'SHORT':
         return 1.0
+    if cluster_risk == 'DANGEROUS_SHORT':
+        return 0.0
     if mode == 'CRACK' and confidence_pct >= 85:
         return 2.0
     if mode in ('CRACK', 'FLASH') and confidence_pct >= 75:
@@ -130,18 +192,22 @@ def max_leverage_for(confidence_pct, mode, side):
 def prices_for_signal(side, current_price):
     if current_price is None or current_price <= 0:
         return None, None, None, None
-
     entry_low = current_price * 0.98
     entry_high = current_price * 1.02
-
     if side == 'SHORT':
         tp = current_price * (1.0 - DEFAULT_SHORT_TP_PCT / 100.0)
         sl = current_price * (1.0 + DEFAULT_SHORT_SL_PCT / 100.0)
     else:
         tp = current_price * (1.0 + DEFAULT_LONG_TP_PCT / 100.0)
         sl = current_price * (1.0 - DEFAULT_LONG_SL_PCT / 100.0)
-
     return entry_low, entry_high, tp, sl
+
+
+def log_skip(token_id, mode, status, note):
+    cur.execute(
+        'INSERT INTO signal_debug_log(ts, token_id, mode, status, note) VALUES (%s,%s,%s,%s,%s)',
+        (utcnow(), str(token_id), mode, status, note[:1000]),
+    )
 
 
 cur.execute('''
@@ -153,10 +219,12 @@ SELECT
     lf.max_pump_pct,
     lf.max_drawdown_pct,
     lf.age_seconds,
+    lf.snapshots,
     lf.volume,
     lf.buys,
     lf.sells,
     lf.traders,
+    lf.buy_sell_ratio,
     ss.side,
     ss.strategy,
     ss.entry_threshold,
@@ -175,6 +243,7 @@ WHERE lf.age_seconds <= %s
   AND ss.winrate >= %s
   AND ss.avg_pnl >= %s
   AND ss.side = 'SHORT'
+ORDER BY ss.avg_pnl DESC
 ''', (
     MAX_SIGNAL_AGE_SECONDS,
     MIN_SIGNAL_TRADES,
@@ -184,41 +253,54 @@ WHERE lf.age_seconds <= %s
 
 rows = cur.fetchall()
 created = 0
+skipped = {}
 
 for row in rows:
     (
-        token_id,
-        mode,
-        current_price,
-        current_return_pct,
-        max_pump_pct,
-        max_drawdown_pct,
-        age_seconds,
-        volume,
-        buys,
-        sells,
-        traders,
-        side,
-        strategy,
-        entry_threshold,
-        take_profit,
-        stop_loss,
-        trades,
-        winrate,
-        avg_pnl,
-        median_pnl,
-        worst_pnl,
+        token_id, mode, current_price, current_return_pct, max_pump_pct, max_drawdown_pct,
+        age_seconds, snapshots, volume, buys, sells, traders, buy_sell_ratio,
+        side, strategy, entry_threshold, take_profit, stop_loss,
+        trades, winrate, avg_pnl, median_pnl, worst_pnl,
     ) = row
 
-    if current_return_pct is None or current_price is None:
+    if current_return_pct is None or current_price is None or max_pump_pct is None:
+        skipped['missing_price'] = skipped.get('missing_price', 0) + 1
         continue
+
+    if snapshots < MIN_LIVE_SNAPSHOTS_FOR_SIGNAL:
+        skipped['too_few_snapshots'] = skipped.get('too_few_snapshots', 0) + 1
+        continue
+
+    reversal_from_peak_pct = max_pump_pct - current_return_pct
+    cluster_name, cluster_risk = classify_live_cluster(
+        current_return_pct, max_pump_pct, max_drawdown_pct, reversal_from_peak_pct, buy_sell_ratio, snapshots
+    )
+
+    if cluster_risk == 'DANGEROUS_SHORT':
+        skipped['dangerous_runner_cluster'] = skipped.get('dangerous_runner_cluster', 0) + 1
+        log_skip(token_id, mode, 'skip_runner', f'{cluster_name}; pump={max_pump_pct:.2f}; reversal={reversal_from_peak_pct:.2f}')
+        continue
+
+    if max_pump_pct < MIN_PUMP_FOR_REVERSAL_PCT:
+        skipped['pump_too_small'] = skipped.get('pump_too_small', 0) + 1
+        continue
+
+    if reversal_from_peak_pct < MIN_REVERSAL_FROM_PEAK_PCT:
+        if not (ALLOW_NO_REVERSAL_FOR_CRACK and mode == 'CRACK'):
+            skipped['no_reversal_yet'] = skipped.get('no_reversal_yet', 0) + 1
+            continue
 
     threshold_pct = (entry_threshold - 1.0) * 100.0
-    if current_return_pct < threshold_pct:
+    if max_pump_pct < threshold_pct:
+        skipped['strategy_threshold_not_met'] = skipped.get('strategy_threshold_not_met', 0) + 1
         continue
 
-    conf_pct = confidence_score(winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side)
+    conf_pct = confidence_score(
+        winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side,
+        cluster_name, cluster_risk, reversal_from_peak_pct,
+    )
     if conf_pct < MIN_SIGNAL_CONFIDENCE:
+        skipped['low_confidence'] = skipped.get('low_confidence', 0) + 1
         continue
 
     cur.execute('''
@@ -229,21 +311,25 @@ for row in rows:
       AND created_at >= NOW() - interval '30 minutes'
     LIMIT 1
     ''', (token_id, side))
-
     if cur.fetchone():
+        skipped['duplicate_recent'] = skipped.get('duplicate_recent', 0) + 1
         continue
 
     entry_low, entry_high, tp_price, sl_price = prices_for_signal(side, current_price)
-    max_lev = max_leverage_for(conf_pct, mode, side)
+    max_lev = max_leverage_for(conf_pct, mode, side, cluster_risk)
+    if max_lev <= 0:
+        skipped['zero_leverage'] = skipped.get('zero_leverage', 0) + 1
+        continue
+
     conf_label = confidence_label(conf_pct)
     signal_type = f'{side}_SIGNAL'
-
     url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
     reason = (
-        f'{mode} matched {strategy} | current={current_return_pct:.2f}% | '
+        f'{mode} matched {strategy} | cluster={cluster_name}/{cluster_risk} | '
+        f'current={current_return_pct:.2f}% | max_pump={max_pump_pct:.2f}% | '
+        f'reversal={reversal_from_peak_pct:.2f}% | snapshots={snapshots} | '
         f'historical winrate={winrate*100:.1f}% | avg={avg_pnl:.2f}% | '
-        f'median={median_pnl:.2f}% | worst={worst_pnl:.2f}% | '
-        f'trades={trades} | url={url}'
+        f'median={median_pnl:.2f}% | worst={worst_pnl:.2f}% | trades={trades} | url={url}'
     )
 
     cur.execute('''
@@ -254,31 +340,16 @@ for row in rows:
         historical_trades, historical_winrate,
         historical_avg_pnl, historical_median_pnl,
         historical_worst_pnl,
-        reason, created_at
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        reason, created_at,
+        live_snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     ''', (
-        token_id,
-        mode,
-        side,
-        signal_type,
-        conf_label,
-        conf_pct,
-        current_price,
-        entry_low,
-        entry_high,
-        tp_price,
-        sl_price,
-        max_lev,
-        current_return_pct,
-        strategy,
-        trades,
-        winrate,
-        avg_pnl,
-        median_pnl,
-        worst_pnl,
-        reason,
-        datetime.utcnow(),
+        token_id, mode, side, signal_type, conf_label, conf_pct,
+        current_price, entry_low, entry_high, tp_price, sl_price, max_lev,
+        current_return_pct, strategy,
+        trades, winrate, avg_pnl, median_pnl, worst_pnl,
+        reason, utcnow(), snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk,
     ))
     signal_id = cur.fetchone()[0]
 
@@ -289,37 +360,20 @@ for row in rows:
     ) VALUES (%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s)
     ON CONFLICT(signal_id) DO NOTHING
     ''', (
-        signal_id,
-        token_id,
-        mode,
-        side,
-        conf_pct,
-        current_price,
-        tp_price,
-        sl_price,
-        max_lev,
-        datetime.utcnow(),
+        signal_id, token_id, mode, side, conf_pct,
+        current_price, tp_price, sl_price, max_lev, utcnow(),
     ))
-
     created += 1
 
 print(f'live signals created: {created}', flush=True)
+if skipped:
+    print('signal skips:', ', '.join(f'{k}={v}' for k, v in sorted(skipped.items())), flush=True)
 
 cur.execute('''
 SELECT
-    token_id,
-    mode,
-    side,
-    confidence_pct,
-    current_price,
-    entry_low,
-    entry_high,
-    take_profit_price,
-    stop_loss_price,
-    max_leverage,
-    matched_strategy,
-    historical_winrate,
-    historical_avg_pnl
+    token_id, mode, side, confidence_pct, current_price, entry_low, entry_high,
+    take_profit_price, stop_loss_price, max_leverage, matched_strategy,
+    historical_winrate, historical_avg_pnl, cluster_name, reversal_from_peak_pct
 FROM live_signals
 ORDER BY id DESC
 LIMIT 20
@@ -327,6 +381,9 @@ LIMIT 20
 
 for row in cur.fetchall():
     print(
-        f'{row[0]} {row[1]} {row[2]} conf={row[3]}% price={row[4]:.6f} entry={row[5]:.6f}-{row[6]:.6f} tp={row[7]:.6f} sl={row[8]:.6f} lev=x{row[9]} strategy={row[10]} win={row[11]*100:.1f}% avg={row[12]:.2f}%',
+        f'{row[0]} {row[1]} {row[2]} conf={row[3]}% price={row[4]:.6f} '
+        f'entry={row[5]:.6f}-{row[6]:.6f} tp={row[7]:.6f} sl={row[8]:.6f} '
+        f'lev=x{row[9]} strategy={row[10]} win={row[11]*100:.1f}% avg={row[12]:.2f}% '
+        f'cluster={row[13]} reversal={row[14]:.2f}%',
         flush=True,
     )
