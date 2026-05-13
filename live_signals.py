@@ -20,6 +20,10 @@ DEFAULT_SHORT_TP_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_TP_PCT', '30'))
 DEFAULT_SHORT_SL_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_SL_PCT', '35'))
 DEFAULT_LONG_TP_PCT = float(os.getenv('LIVE_SIGNAL_LONG_TP_PCT', '20'))
 DEFAULT_LONG_SL_PCT = float(os.getenv('LIVE_SIGNAL_LONG_SL_PCT', '25'))
+ADAPTIVE_LIVE_ENABLED = os.getenv('LIVE_SIGNALS_ADAPTIVE_LIVE_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on')
+ADAPTIVE_MIN_CLOSED_TRADES = int(os.getenv('LIVE_SIGNALS_ADAPTIVE_MIN_CLOSED_TRADES', '5'))
+ADAPTIVE_DISABLE_WINRATE = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_WINRATE', '0.35'))
+ADAPTIVE_DISABLE_AVG_PNL = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_AVG_PNL', '-15'))
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -75,6 +79,8 @@ for ddl in [
     'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reversal_from_peak_pct DOUBLE PRECISION',
     'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_name TEXT',
     'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_risk TEXT',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS adaptive_adjustment INT DEFAULT 0',
+    'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS adaptive_reason TEXT',
 ]:
     cur.execute(ddl)
 
@@ -148,6 +154,54 @@ def cluster_adjustment(cluster_name, cluster_risk):
     return 0
 
 
+def live_performance_adjustment(mode, cluster_name, cluster_risk):
+    if not ADAPTIVE_LIVE_ENABLED or not table_exists('live_performance_summary'):
+        return 0, 'adaptive_disabled_or_no_summary'
+
+    checks = [
+        ('cluster', cluster_name),
+        ('cluster_risk', cluster_risk),
+        ('mode', mode),
+    ]
+    total_adj = 0
+    reasons = []
+
+    for bucket_type, bucket_value in checks:
+        if not bucket_value:
+            continue
+        cur.execute('''
+        SELECT closed_trades, winrate, avg_pnl_pct, median_pnl_pct
+        FROM live_performance_summary
+        WHERE bucket_type = %s
+          AND bucket_value = %s
+        ORDER BY lookback_hours ASC
+        LIMIT 1
+        ''', (bucket_type, str(bucket_value)))
+        row = cur.fetchone()
+        if not row:
+            continue
+
+        closed, winrate, avg_pnl, median_pnl = row
+        if closed < ADAPTIVE_MIN_CLOSED_TRADES:
+            reasons.append(f'{bucket_type}:{bucket_value}=not_enough_live_n{closed}')
+            continue
+
+        adj = 0
+        if winrate <= ADAPTIVE_DISABLE_WINRATE and avg_pnl <= ADAPTIVE_DISABLE_AVG_PNL:
+            adj = -100
+        elif winrate < 0.45 or avg_pnl < -5:
+            adj = -15
+        elif winrate >= 0.65 and avg_pnl > 10:
+            adj = 12
+        elif winrate >= 0.55 and avg_pnl > 0:
+            adj = 5
+
+        total_adj += adj
+        reasons.append(f'{bucket_type}:{bucket_value} n={closed} win={winrate*100:.1f}% avg={avg_pnl:.1f}% adj={adj}')
+
+    return int(clamp(total_adj, -100, 25)), '; '.join(reasons) if reasons else 'no_live_performance_match'
+
+
 def confidence_score(winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side, cluster_name, cluster_risk, reversal_from_peak_pct):
     score = 40
     score += (winrate - 0.50) * 140
@@ -212,44 +266,20 @@ def log_skip(token_id, mode, status, note):
 
 cur.execute('''
 SELECT
-    lf.token_id,
-    lf.mode,
-    lf.current_price,
-    lf.current_return_pct,
-    lf.max_pump_pct,
-    lf.max_drawdown_pct,
-    lf.age_seconds,
-    lf.snapshots,
-    lf.volume,
-    lf.buys,
-    lf.sells,
-    lf.traders,
-    lf.buy_sell_ratio,
-    ss.side,
-    ss.strategy,
-    ss.entry_threshold,
-    ss.take_profit,
-    ss.stop_loss,
-    ss.trades,
-    ss.winrate,
-    ss.avg_pnl,
-    ss.median_pnl,
-    ss.worst_pnl
+    lf.token_id, lf.mode, lf.current_price, lf.current_return_pct,
+    lf.max_pump_pct, lf.max_drawdown_pct, lf.age_seconds,
+    lf.snapshots, lf.volume, lf.buys, lf.sells, lf.traders, lf.buy_sell_ratio,
+    ss.side, ss.strategy, ss.entry_threshold, ss.take_profit, ss.stop_loss,
+    ss.trades, ss.winrate, ss.avg_pnl, ss.median_pnl, ss.worst_pnl
 FROM live_token_features lf
-JOIN strategy_sweep ss
-  ON ss.mode = lf.mode
+JOIN strategy_sweep ss ON ss.mode = lf.mode
 WHERE lf.age_seconds <= %s
   AND ss.trades >= %s
   AND ss.winrate >= %s
   AND ss.avg_pnl >= %s
   AND ss.side = 'SHORT'
 ORDER BY ss.avg_pnl DESC
-''', (
-    MAX_SIGNAL_AGE_SECONDS,
-    MIN_SIGNAL_TRADES,
-    MIN_SIGNAL_WINRATE,
-    MIN_SIGNAL_EXPECTANCY,
-))
+''', (MAX_SIGNAL_AGE_SECONDS, MIN_SIGNAL_TRADES, MIN_SIGNAL_WINRATE, MIN_SIGNAL_EXPECTANCY))
 
 rows = cur.fetchall()
 created = 0
@@ -295,20 +325,21 @@ for row in rows:
         skipped['strategy_threshold_not_met'] = skipped.get('strategy_threshold_not_met', 0) + 1
         continue
 
-    conf_pct = confidence_score(
-        winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side,
-        cluster_name, cluster_risk, reversal_from_peak_pct,
-    )
+    base_conf = confidence_score(winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side, cluster_name, cluster_risk, reversal_from_peak_pct)
+    adaptive_adj, adaptive_reason = live_performance_adjustment(mode, cluster_name, cluster_risk)
+    if adaptive_adj <= -100:
+        skipped['adaptive_disabled_setup'] = skipped.get('adaptive_disabled_setup', 0) + 1
+        log_skip(token_id, mode, 'adaptive_disabled', adaptive_reason)
+        continue
+
+    conf_pct = int(round(clamp(base_conf + adaptive_adj, 1, 99)))
     if conf_pct < MIN_SIGNAL_CONFIDENCE:
         skipped['low_confidence'] = skipped.get('low_confidence', 0) + 1
         continue
 
     cur.execute('''
-    SELECT 1
-    FROM live_signals
-    WHERE token_id = %s
-      AND side = %s
-      AND created_at >= NOW() - interval '30 minutes'
+    SELECT 1 FROM live_signals
+    WHERE token_id = %s AND side = %s AND created_at >= NOW() - interval '30 minutes'
     LIMIT 1
     ''', (token_id, side))
     if cur.fetchone():
@@ -326,6 +357,7 @@ for row in rows:
     url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
     reason = (
         f'{mode} matched {strategy} | cluster={cluster_name}/{cluster_risk} | '
+        f'base_conf={base_conf}% adaptive_adj={adaptive_adj} | adaptive={adaptive_reason} | '
         f'current={current_return_pct:.2f}% | max_pump={max_pump_pct:.2f}% | '
         f'reversal={reversal_from_peak_pct:.2f}% | snapshots={snapshots} | '
         f'historical winrate={winrate*100:.1f}% | avg={avg_pnl:.2f}% | '
@@ -337,19 +369,19 @@ for row in rows:
         token_id, mode, side, signal_type, confidence, confidence_pct,
         current_price, entry_low, entry_high, take_profit_price, stop_loss_price, max_leverage,
         current_return_pct, matched_strategy,
-        historical_trades, historical_winrate,
-        historical_avg_pnl, historical_median_pnl,
-        historical_worst_pnl,
-        reason, created_at,
-        live_snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        historical_trades, historical_winrate, historical_avg_pnl, historical_median_pnl,
+        historical_worst_pnl, reason, created_at,
+        live_snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk,
+        adaptive_adjustment, adaptive_reason
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     ''', (
         token_id, mode, side, signal_type, conf_label, conf_pct,
         current_price, entry_low, entry_high, tp_price, sl_price, max_lev,
         current_return_pct, strategy,
-        trades, winrate, avg_pnl, median_pnl, worst_pnl,
-        reason, utcnow(), snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk,
+        trades, winrate, avg_pnl, median_pnl, worst_pnl, reason, utcnow(),
+        snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk,
+        adaptive_adj, adaptive_reason,
     ))
     signal_id = cur.fetchone()[0]
 
@@ -359,10 +391,7 @@ for row in rows:
         entry_price, take_profit_price, stop_loss_price, max_leverage, opened_at
     ) VALUES (%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s)
     ON CONFLICT(signal_id) DO NOTHING
-    ''', (
-        signal_id, token_id, mode, side, conf_pct,
-        current_price, tp_price, sl_price, max_lev, utcnow(),
-    ))
+    ''', (signal_id, token_id, mode, side, conf_pct, current_price, tp_price, sl_price, max_lev, utcnow()))
     created += 1
 
 print(f'live signals created: {created}', flush=True)
@@ -370,10 +399,10 @@ if skipped:
     print('signal skips:', ', '.join(f'{k}={v}' for k, v in sorted(skipped.items())), flush=True)
 
 cur.execute('''
-SELECT
-    token_id, mode, side, confidence_pct, current_price, entry_low, entry_high,
-    take_profit_price, stop_loss_price, max_leverage, matched_strategy,
-    historical_winrate, historical_avg_pnl, cluster_name, reversal_from_peak_pct
+SELECT token_id, mode, side, confidence_pct, current_price, entry_low, entry_high,
+       take_profit_price, stop_loss_price, max_leverage, matched_strategy,
+       historical_winrate, historical_avg_pnl, cluster_name, reversal_from_peak_pct,
+       adaptive_adjustment
 FROM live_signals
 ORDER BY id DESC
 LIMIT 20
@@ -384,6 +413,6 @@ for row in cur.fetchall():
         f'{row[0]} {row[1]} {row[2]} conf={row[3]}% price={row[4]:.6f} '
         f'entry={row[5]:.6f}-{row[6]:.6f} tp={row[7]:.6f} sl={row[8]:.6f} '
         f'lev=x{row[9]} strategy={row[10]} win={row[11]*100:.1f}% avg={row[12]:.2f}% '
-        f'cluster={row[13]} reversal={row[14]:.2f}%',
+        f'cluster={row[13]} reversal={row[14]:.2f}% adaptive={row[15]}',
         flush=True,
     )
