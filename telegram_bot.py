@@ -14,6 +14,17 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 BACKUP_MAX_ROWS_PER_TABLE = int(os.getenv('BACKUP_MAX_ROWS_PER_TABLE', '0'))
 BACKUP_INCLUDE_SNAPSHOTS = os.getenv('BACKUP_INCLUDE_SNAPSHOTS', 'true').lower() in ('1', 'true', 'yes', 'on')
+PG_DUMP_TIMEOUT_SECONDS = int(os.getenv('PG_DUMP_TIMEOUT_SECONDS', '600'))
+PG_DUMP_CORE_TABLES = [
+    'finished_tokens',
+    'trajectory_features',
+    'paper_trades',
+    'strategy_sweep',
+    'trajectory_clusters',
+    'official_api_token_state',
+    'live_token_features',
+    'live_signals',
+]
 
 conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
@@ -86,6 +97,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Caput bot online\n\n'
         '/status - collector and dataset status\n'
         '/backup - export DB CSV ZIP\n'
+        '/pg_dump_core - PostgreSQL dump without token_snapshots/logs\n'
         '/pg_dump - full PostgreSQL dump (.sql.gz)'
     )
 
@@ -166,48 +178,59 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=zip_buffer, filename=filename)
 
 
-async def pg_dump_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Creating PostgreSQL pg_dump backup...')
+async def run_pg_dump(update: Update, table_names=None, label='full'):
+    await update.message.reply_text(f'Creating PostgreSQL {label} pg_dump backup...')
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        sql_path = os.path.join(tmpdir, 'caput_pg_dump.sql')
-        gz_path = sql_path + '.gz'
+        dump_path = os.path.join(tmpdir, 'caput_pg_dump.dump')
 
         dump_cmd = [
             'pg_dump',
+            '--format=custom',
+            '--compress=9',
             '--no-owner',
             '--no-privileges',
             DATABASE_URL,
             '-f',
-            sql_path,
+            dump_path,
         ]
 
-        dump_proc = subprocess.run(
-            dump_cmd,
-            capture_output=True,
-            text=True,
-        )
+        if table_names:
+            for table_name in table_names:
+                dump_cmd.extend(['--table', f'public.{safe_identifier(table_name)}'])
+
+        try:
+            dump_proc = subprocess.run(
+                dump_cmd,
+                capture_output=True,
+                text=True,
+                timeout=PG_DUMP_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            await update.message.reply_text(
+                f'pg_dump timed out after {PG_DUMP_TIMEOUT_SECONDS}s. Use /pg_dump_core or increase PG_DUMP_TIMEOUT_SECONDS.'
+            )
+            return
 
         if dump_proc.returncode != 0:
             err = dump_proc.stderr[-3000:]
             await update.message.reply_text(f'pg_dump failed:\n\n{err}')
             return
 
-        gzip_proc = subprocess.run(
-            ['gzip', '-f', sql_path],
-            capture_output=True,
-            text=True,
-        )
+        filename = f'caput_pg_dump_{label}_{utc_stamp()}.dump'
+        size_mb = os.path.getsize(dump_path) / 1024 / 1024
+        await update.message.reply_text(f'pg_dump ready: {size_mb:.2f} MB. Uploading...')
 
-        if gzip_proc.returncode != 0:
-            err = gzip_proc.stderr[-3000:]
-            await update.message.reply_text(f'gzip failed:\n\n{err}')
-            return
-
-        filename = f'caput_pg_dump_{utc_stamp()}.sql.gz'
-
-        with open(gz_path, 'rb') as f:
+        with open(dump_path, 'rb') as f:
             await update.message.reply_document(document=f, filename=filename)
+
+
+async def pg_dump_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_pg_dump(update, table_names=None, label='full')
+
+
+async def pg_dump_core(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_pg_dump(update, table_names=PG_DUMP_CORE_TABLES, label='core')
 
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -216,4 +239,5 @@ app.add_handler(CommandHandler('status', status))
 app.add_handler(CommandHandler('stats', status))
 app.add_handler(CommandHandler('backup', backup))
 app.add_handler(CommandHandler('pg_dump', pg_dump_backup))
+app.add_handler(CommandHandler('pg_dump_core', pg_dump_core))
 app.run_polling()
