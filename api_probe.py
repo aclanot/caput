@@ -101,8 +101,10 @@ query ApiProbeTokens($input: PublicTokenListInput!) {
       rank
     }
     meta {
-      endCursor
+      firstCursor
+      lastCursor
       hasNextItems
+      hasPreviousItems
     }
   }
 }
@@ -196,16 +198,16 @@ def try_tokens_examples(headers, by_name):
     print(f'CursorPaginationInput fields: {pagination_fields}')
 
     pagination_candidates = []
-    if 'first' in pagination_fields:
-        pagination_candidates.append({'first': 5})
     if 'limit' in pagination_fields:
         pagination_candidates.append({'limit': 5})
+    if 'first' in pagination_fields:
+        pagination_candidates.append({'first': 5})
     if 'take' in pagination_fields:
         pagination_candidates.append({'take': 5})
     if 'size' in pagination_fields:
         pagination_candidates.append({'size': 5})
     if not pagination_candidates:
-        pagination_candidates.append({'first': 5})
+        pagination_candidates.append({'limit': 5})
 
     candidates = []
     for pagination in pagination_candidates:
