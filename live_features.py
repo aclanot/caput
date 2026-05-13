@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import psycopg
 from dotenv import load_dotenv
@@ -16,6 +16,10 @@ if not DATABASE_URL:
 conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 cur = conn.cursor()
+
+
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 cur.execute('''
 CREATE TABLE IF NOT EXISTS live_token_features (
@@ -112,7 +116,7 @@ ON CONFLICT(token_id) DO UPDATE SET
     traders = EXCLUDED.traders,
     buy_sell_ratio = EXCLUDED.buy_sell_ratio,
     updated_at = EXCLUDED.updated_at
-''', (LOOKBACK_MINUTES, datetime.utcnow(), MIN_SNAPSHOTS))
+''', (LOOKBACK_MINUTES, utcnow(), MIN_SNAPSHOTS))
 
 cur.execute('SELECT COUNT(*) FROM live_token_features WHERE updated_at >= NOW() - interval \'5 minutes\'')
 updated = cur.fetchone()[0]
