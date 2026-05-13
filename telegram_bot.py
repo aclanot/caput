@@ -1,6 +1,8 @@
 import csv
 import io
 import os
+import subprocess
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 
@@ -83,14 +85,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         'Caput bot online\n\n'
         '/status - collector and dataset status\n'
-        '/summary - pattern summary by mode\n'
-        '/paper - paper simulation summary\n'
-        '/sweep - top optimized parameter sets\n'
-        '/latest - latest saved trajectories\n'
-        '/backup - export DB backup ZIP\n'
-        '/export - export finished trajectories CSV\n'
-        '/export_features - export analysis features CSV\n'
-        '/export_sweep - export sweep results CSV'
+        '/backup - export DB CSV ZIP\n'
+        '/pg_dump - full PostgreSQL dump (.sql.gz)'
     )
 
 
@@ -114,9 +110,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     paper = 0
     if table_exists(cur, 'paper_trades'):
         cur.execute('SELECT COUNT(*) FROM paper_trades')
-        paper = cur.fetchone()[0]
-    elif table_exists(cur, 'virtual_trades'):
-        cur.execute('SELECT COUNT(*) FROM virtual_trades')
         paper = cur.fetchone()[0]
 
     sweep_count = 0
@@ -143,25 +136,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Summary available after analysis.')
-
-
-async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Paper stats available after paper_sim.py.')
-
-
-async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Sweep stats available after sweep.py.')
-
-
-async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Latest trajectory view enabled.')
-
-
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
-    await update.message.reply_text('Creating backup ZIP...')
+    await update.message.reply_text('Creating CSV backup ZIP...')
 
     zip_buffer = io.BytesIO()
     manifest_lines = [
@@ -189,13 +166,54 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=zip_buffer, filename=filename)
 
 
+async def pg_dump_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('Creating PostgreSQL pg_dump backup...')
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sql_path = os.path.join(tmpdir, 'caput_pg_dump.sql')
+        gz_path = sql_path + '.gz'
+
+        dump_cmd = [
+            'pg_dump',
+            '--no-owner',
+            '--no-privileges',
+            DATABASE_URL,
+            '-f',
+            sql_path,
+        ]
+
+        dump_proc = subprocess.run(
+            dump_cmd,
+            capture_output=True,
+            text=True,
+        )
+
+        if dump_proc.returncode != 0:
+            err = dump_proc.stderr[-3000:]
+            await update.message.reply_text(f'pg_dump failed:\n\n{err}')
+            return
+
+        gzip_proc = subprocess.run(
+            ['gzip', '-f', sql_path],
+            capture_output=True,
+            text=True,
+        )
+
+        if gzip_proc.returncode != 0:
+            err = gzip_proc.stderr[-3000:]
+            await update.message.reply_text(f'gzip failed:\n\n{err}')
+            return
+
+        filename = f'caput_pg_dump_{utc_stamp()}.sql.gz'
+
+        with open(gz_path, 'rb') as f:
+            await update.message.reply_document(document=f, filename=filename)
+
+
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler('start', start))
 app.add_handler(CommandHandler('status', status))
 app.add_handler(CommandHandler('stats', status))
-app.add_handler(CommandHandler('summary', summary))
-app.add_handler(CommandHandler('paper', paper))
-app.add_handler(CommandHandler('sweep', sweep))
-app.add_handler(CommandHandler('latest', latest))
 app.add_handler(CommandHandler('backup', backup))
+app.add_handler(CommandHandler('pg_dump', pg_dump_backup))
 app.run_polling()
