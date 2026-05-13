@@ -399,3 +399,33 @@ risk + leverage suggestion
 ↓
 telegram alert
 ```
+
+---
+
+# QUICK RUN ORDER
+
+Terminal 1:
+
+```bash
+python official_api_collector.py
+```
+
+Terminal 2:
+
+```bash
+python signal_broadcaster.py
+```
+
+Terminal 3:
+
+```bash
+python live_loop.py
+```
+
+Historical:
+
+```bash
+python fast_finished_collector.py
+python auto_run.py
+python clusters.py
+```

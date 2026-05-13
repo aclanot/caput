@@ -8,9 +8,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-INTERVAL_SECONDS = float(os.getenv('LIVE_LOOP_INTERVAL_SECONDS', '20'))
-RUN_FEATURES = os.getenv('LIVE_LOOP_RUN_FEATURES', 'true').lower() in ('1', 'true', 'yes', 'on')
-RUN_SIGNALS = os.getenv('LIVE_LOOP_RUN_SIGNALS', 'true').lower() in ('1', 'true', 'yes', 'on')
+INTERVAL_SECONDS = float(os.getenv('LIVE_LOOP_INTERVAL_SECONDS', '5'))
+RUN_PERFORMANCE = os.getenv('LIVE_LOOP_RUN_PERFORMANCE', 'true').lower() in ('1', 'true', 'yes', 'on')
+PERFORMANCE_EVERY_N = int(os.getenv('LIVE_LOOP_PERFORMANCE_EVERY_N', '12'))
 
 
 def utcnow():
@@ -19,44 +19,29 @@ def utcnow():
 
 def run_script(script):
     print(f'\n{utcnow()} UTC | START | {script}', flush=True)
-    proc = subprocess.run(
-        [sys.executable, script],
-        text=True,
-        capture_output=True,
-    )
-
+    proc = subprocess.run([sys.executable, script], text=True, capture_output=True)
     if proc.stdout:
         print(proc.stdout.strip(), flush=True)
     if proc.stderr:
         print(proc.stderr.strip(), flush=True)
-
     if proc.returncode != 0:
         print(f'{utcnow()} UTC | ERROR | {script} | code={proc.returncode}', flush=True)
-        return False
-
-    print(f'{utcnow()} UTC | OK | {script}', flush=True)
-    return True
+    else:
+        print(f'{utcnow()} UTC | OK | {script}', flush=True)
 
 
 def main():
     print('live loop started', flush=True)
-    print(f'interval={INTERVAL_SECONDS}s run_features={RUN_FEATURES} run_signals={RUN_SIGNALS}', flush=True)
-    print('Keep official_api_collector.py running in another terminal/service.', flush=True)
-    print('Keep signal_broadcaster.py running in another terminal/service for Telegram + paper trade tracking.', flush=True)
-
+    print(f'interval={INTERVAL_SECONDS}s run_performance={RUN_PERFORMANCE} performance_every_n={PERFORMANCE_EVERY_N}', flush=True)
+    cycle = 0
     while True:
-        cycle_started = utcnow()
-        print(f'\n================================================================================', flush=True)
-        print(f'{cycle_started} UTC | LIVE CYCLE START', flush=True)
-        print(f'================================================================================', flush=True)
-
-        if RUN_FEATURES:
-            run_script('live_features.py')
-
-        if RUN_SIGNALS:
-            run_script('live_signals.py')
-
-        print(f'{utcnow()} UTC | LIVE CYCLE DONE | sleeping {INTERVAL_SECONDS}s', flush=True)
+        cycle += 1
+        print(f'\n{utcnow()} UTC | CYCLE {cycle} START', flush=True)
+        run_script('live_features.py')
+        run_script('live_signals.py')
+        if RUN_PERFORMANCE and PERFORMANCE_EVERY_N > 0 and cycle % PERFORMANCE_EVERY_N == 0:
+            run_script('live_performance.py')
+        print(f'{utcnow()} UTC | CYCLE {cycle} DONE | sleep={INTERVAL_SECONDS}s', flush=True)
         time.sleep(INTERVAL_SECONDS)
 
 
