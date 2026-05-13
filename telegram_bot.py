@@ -47,6 +47,11 @@ def table_exists(cur, table_name):
     return cur.fetchone()[0] is not None
 
 
+def existing_tables(table_names):
+    cur = conn.cursor()
+    return [name for name in table_names if table_exists(cur, name)]
+
+
 def safe_identifier(name):
     if not name.replace('_', '').isalnum():
         raise ValueError(f'unsafe table name: {name}')
@@ -98,7 +103,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '/status - collector and dataset status\n'
         '/backup - export DB CSV ZIP\n'
         '/pg_dump_core - PostgreSQL dump without token_snapshots/logs\n'
-        '/pg_dump - full PostgreSQL dump (.sql.gz)'
+        '/pg_dump - full PostgreSQL dump (.dump)'
     )
 
 
@@ -181,6 +186,11 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_pg_dump(update: Update, table_names=None, label='full'):
     await update.message.reply_text(f'Creating PostgreSQL {label} pg_dump backup...')
 
+    selected_tables = existing_tables(table_names) if table_names else None
+    if table_names and not selected_tables:
+        await update.message.reply_text('No requested tables exist yet, nothing to dump.')
+        return
+
     with tempfile.TemporaryDirectory() as tmpdir:
         dump_path = os.path.join(tmpdir, 'caput_pg_dump.dump')
 
@@ -195,8 +205,8 @@ async def run_pg_dump(update: Update, table_names=None, label='full'):
             dump_path,
         ]
 
-        if table_names:
-            for table_name in table_names:
+        if selected_tables:
+            for table_name in selected_tables:
                 dump_cmd.extend(['--table', f'public.{safe_identifier(table_name)}'])
 
         try:
@@ -219,7 +229,10 @@ async def run_pg_dump(update: Update, table_names=None, label='full'):
 
         filename = f'caput_pg_dump_{label}_{utc_stamp()}.dump'
         size_mb = os.path.getsize(dump_path) / 1024 / 1024
-        await update.message.reply_text(f'pg_dump ready: {size_mb:.2f} MB. Uploading...')
+        table_note = ''
+        if selected_tables:
+            table_note = '\nTables: ' + ', '.join(selected_tables)
+        await update.message.reply_text(f'pg_dump ready: {size_mb:.2f} MB. Uploading...{table_note}')
 
         with open(dump_path, 'rb') as f:
             await update.message.reply_document(document=f, filename=filename)
