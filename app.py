@@ -4,6 +4,11 @@ import subprocess
 import sys
 import time
 
+RESTART_INITIAL_SECONDS = float(os.getenv('WORKER_RESTART_INITIAL_SECONDS', '5'))
+RESTART_MAX_SECONDS = float(os.getenv('WORKER_RESTART_MAX_SECONDS', '60'))
+STABLE_RUN_SECONDS = float(os.getenv('WORKER_STABLE_RUN_SECONDS', '120'))
+SUPERVISOR_SLEEP_SECONDS = float(os.getenv('APP_SUPERVISOR_SLEEP_SECONDS', '5'))
+
 
 def truthy(value):
     return str(value or '').lower() in ('1', 'true', 'yes', 'on')
@@ -16,22 +21,73 @@ def enabled(name, default=True):
     return truthy(value)
 
 
-def start_process(label, script, required_env=()):
-    missing = [name for name in required_env if not os.getenv(name)]
-    if missing:
-        print(f'{label} disabled. Missing env: {", ".join(missing)}', flush=True)
-        return None
+def make_worker(label, script, required_env=()):
+    return {
+        'label': label,
+        'script': script,
+        'required_env': tuple(required_env),
+        'proc': None,
+        'started_at': None,
+        'restart_count': 0,
+        'next_start_at': 0.0,
+    }
 
+
+def prepare_workers(startup_plan):
+    workers = []
+    for label, script, should_run, required_env in startup_plan:
+        if not should_run:
+            print(f'{label} disabled by env.', flush=True)
+            continue
+
+        missing = [name for name in required_env if not os.getenv(name)]
+        if missing:
+            print(f'{label} disabled. Missing env: {", ".join(missing)}', flush=True)
+            continue
+
+        workers.append(make_worker(label, script, required_env=required_env))
+    return workers
+
+
+def schedule_restart(worker, reason):
+    worker['restart_count'] += 1
+    exponent = min(worker['restart_count'] - 1, 5)
+    delay = min(RESTART_MAX_SECONDS, RESTART_INITIAL_SECONDS * (2 ** exponent))
+    worker['next_start_at'] = time.monotonic() + delay
+    print(f'{worker["label"]} restart scheduled in {delay:g}s ({reason}).', flush=True)
+
+
+def start_worker(worker):
+    label = worker['label']
+    script = worker['script']
     print(f'Starting {label}: {script}', flush=True)
-    return label, subprocess.Popen([sys.executable, '-u', script])
+    try:
+        worker['proc'] = subprocess.Popen([sys.executable, '-u', script])
+        worker['started_at'] = time.monotonic()
+        worker['next_start_at'] = 0.0
+        return True
+    except Exception as exc:
+        worker['proc'] = None
+        worker['started_at'] = None
+        print(f'{label} failed to start: {exc}', flush=True)
+        schedule_restart(worker, 'start failed')
+        return False
 
 
-def stop_processes(processes):
-    for label, proc in processes:
+def stop_processes(workers):
+    for worker in workers:
+        label = worker['label']
+        proc = worker['proc']
+        if proc is None:
+            continue
         if proc.poll() is None:
             print(f'Stopping {label}', flush=True)
             proc.terminate()
-    for label, proc in processes:
+    for worker in workers:
+        label = worker['label']
+        proc = worker['proc']
+        if proc is None:
+            continue
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -43,13 +99,13 @@ if not os.getenv('DATABASE_URL'):
     print('ERROR: DATABASE_URL is missing.', flush=True)
     sys.exit(1)
 
-processes = []
+workers = []
 bot_only = truthy(os.getenv('BOT_ONLY'))
 
 if bot_only:
-    maybe_proc = start_process('telegram bot', 'telegram_bot.py', required_env=('BOT_TOKEN',))
-    if maybe_proc:
-        processes.append(maybe_proc)
+    workers = prepare_workers([
+        ('telegram bot', 'telegram_bot.py', True, ('BOT_TOKEN',)),
+    ])
 else:
     startup_plan = [
         (
@@ -78,22 +134,19 @@ else:
         ),
     ]
 
-    for label, script, should_run, required_env in startup_plan:
-        if not should_run:
-            print(f'{label} disabled by env.', flush=True)
-            continue
-        maybe_proc = start_process(label, script, required_env=required_env)
-        if maybe_proc:
-            processes.append(maybe_proc)
+    workers = prepare_workers(startup_plan)
 
-if not processes:
+if not workers:
     print('No processes started. Check RUN_* flags and required environment variables.', flush=True)
     sys.exit(1)
+
+for worker in workers:
+    start_worker(worker)
 
 
 def handle_shutdown(signum, frame):
     print(f'Received signal {signum}. Shutting down.', flush=True)
-    stop_processes(processes)
+    stop_processes(workers)
     sys.exit(0)
 
 
@@ -101,10 +154,23 @@ signal.signal(signal.SIGTERM, handle_shutdown)
 signal.signal(signal.SIGINT, handle_shutdown)
 
 while True:
-    for label, proc in processes:
+    now = time.monotonic()
+    for worker in workers:
+        proc = worker['proc']
+        if proc is None:
+            if now >= worker['next_start_at']:
+                start_worker(worker)
+            continue
+
         code = proc.poll()
         if code is not None:
-            print(f'{label} exited with code {code}. Stopping app.', flush=True)
-            stop_processes(processes)
-            sys.exit(code)
-    time.sleep(5)
+            label = worker['label']
+            started_at = worker['started_at'] or now
+            runtime = now - started_at
+            print(f'{label} exited with code {code} after {runtime:.1f}s.', flush=True)
+            worker['proc'] = None
+            worker['started_at'] = None
+            if runtime >= STABLE_RUN_SECONDS:
+                worker['restart_count'] = 0
+            schedule_restart(worker, f'exit code {code}')
+    time.sleep(SUPERVISOR_SLEEP_SECONDS)
