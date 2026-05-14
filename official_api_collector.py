@@ -58,6 +58,7 @@ query OfficialApiTokens($input: PublicTokenListInput!) {
 conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 cur = conn.cursor()
+http = requests.Session()
 
 cur.execute('''
 CREATE TABLE IF NOT EXISTS token_snapshots (
@@ -187,12 +188,15 @@ def fetch_tokens(after_cursor=None):
         'operationName': 'OfficialApiTokens',
         'variables': {'input': build_input(after_cursor=after_cursor)},
     }
-    return requests.post(API_URL, headers=headers, json=payload, timeout=15)
+    return http.post(API_URL, headers=headers, json=payload, timeout=15)
 
 
 def save_items(items):
-    saved = 0
     now = utcnow()
+    snapshot_rows = []
+    state_rows = []
+    raw_rows = []
+
     for item in items:
         token_id = item.get('id')
         if not token_id:
@@ -208,15 +212,32 @@ def save_items(items):
         start_date = parse_api_datetime(item.get('startDate'))
         end_date = parse_api_datetime(item.get('endDate'))
 
-        cur.execute(
+        snapshot_rows.append(
+            (now, token_id, item.get('speedMode'), price, volume, buys, sells, traders)
+        )
+        state_rows.append(
+            (
+                token_id, item.get('name'), item.get('symbol'), item.get('speedMode'), item.get('rank'),
+                initial_price, price, start_date, end_date, volume, buys, sells, traders,
+                json.dumps(item), now, now,
+            )
+        )
+
+        if API_SAVE_RAW:
+            raw_rows.append((now, token_id, json.dumps(item)))
+
+    if not snapshot_rows:
+        return 0
+
+    with conn.pipeline():
+        cur.executemany(
             '''
             INSERT INTO token_snapshots(ts, token_id, mode, price, volume, buys, sells, traders)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             ''',
-            (now, token_id, item.get('speedMode'), price, volume, buys, sells, traders),
+            snapshot_rows,
         )
-
-        cur.execute(
+        cur.executemany(
             '''
             INSERT INTO official_api_token_state(
                 token_id, name, symbol, mode, rank,
@@ -239,20 +260,15 @@ def save_items(items):
                 raw = EXCLUDED.raw,
                 updated_at = EXCLUDED.updated_at
             ''',
-            (
-                token_id, item.get('name'), item.get('symbol'), item.get('speedMode'), item.get('rank'),
-                initial_price, price, start_date, end_date, volume, buys, sells, traders,
-                json.dumps(item), now, now,
-            ),
+            state_rows,
         )
-
-        if API_SAVE_RAW:
-            cur.execute(
+        if raw_rows:
+            cur.executemany(
                 'INSERT INTO official_api_tokens_raw(ts, token_id, response) VALUES (%s,%s,%s)',
-                (now, token_id, json.dumps(item)),
+                raw_rows,
             )
-        saved += 1
-    return saved
+
+    return len(snapshot_rows)
 
 
 def fetch_and_save_cycle():

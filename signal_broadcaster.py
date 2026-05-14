@@ -32,6 +32,11 @@ def utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def execute_ddl_batch(statements):
+    if statements:
+        cur.execute(';\n'.join(statements) + ';')
+
+
 def ensure_schema():
     cur.execute('''
     CREATE TABLE IF NOT EXISTS live_signals (
@@ -60,7 +65,7 @@ def ensure_schema():
         created_at TIMESTAMP
     )
     ''')
-    for ddl in [
+    execute_ddl_batch([
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS sent_to_telegram BOOLEAN DEFAULT FALSE',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_name TEXT',
@@ -68,8 +73,12 @@ def ensure_schema():
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reversal_from_peak_pct DOUBLE PRECISION',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS max_pump_pct DOUBLE PRECISION',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS live_snapshots INT',
-    ]:
-        cur.execute(ddl)
+        "ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS signal_status TEXT DEFAULT 'OPEN'",
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS liquidation_price DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reward_pct DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
+    ])
 
     cur.execute('''
     CREATE TABLE IF NOT EXISTS paper_signal_trades (
@@ -91,14 +100,17 @@ def ensure_schema():
         close_reason TEXT
     )
     ''')
-    for ddl in [
+    execute_ddl_batch([
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS result_sent_to_telegram BOOLEAN DEFAULT FALSE',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_position_usdt DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_balance_at_open DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_pnl_usdt DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_balance_after_close DOUBLE PRECISION',
-    ]:
-        cur.execute(ddl)
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS liquidation_price DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_pct DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
+    ])
 
     cur.execute('''
     CREATE TABLE IF NOT EXISTS paper_account (
@@ -180,6 +192,14 @@ def fmt_money(value):
     return f'${float(value):.2f}'
 
 
+def fmt_liquidation(value, leverage):
+    if value is not None:
+        return fmt_price(value)
+    if leverage is not None and float(leverage) <= 1:
+        return 'n/a (x1)'
+    return 'n/a'
+
+
 def signal_message(row):
     (
         signal_id, token_id, mode, side, confidence_pct,
@@ -187,6 +207,7 @@ def signal_message(row):
         max_leverage, matched_strategy, historical_trades, historical_winrate,
         historical_avg_pnl, historical_median_pnl, historical_worst_pnl, current_return_pct,
         cluster_name, cluster_risk, setup_move_pct, max_pump_pct, live_snapshots,
+        liquidation_price, reward_pct, risk_pct, reward_risk,
         virtual_position_usdt, virtual_balance_at_open,
     ) = row
 
@@ -210,7 +231,11 @@ def signal_message(row):
         f'Current price: {fmt_price(current_price)}\n'
         f'Entry: {fmt_price(entry_low)} - {fmt_price(entry_high)}\n'
         f'Take profit: {fmt_price(take_profit_price)}\n'
-        f'Stop loss: {fmt_price(stop_loss_price)}\n\n'
+        f'Stop loss: {fmt_price(stop_loss_price)}\n'
+        f'Liquidation: {fmt_liquidation(liquidation_price, max_leverage)}\n'
+        f'Reward: {(reward_pct or 0):.2f}%\n'
+        f'Risk to stop: {(risk_pct or 0):.2f}%\n'
+        f'Reward/Risk: {(reward_risk or 0):.2f}\n\n'
         f'Current return: {current_return_pct:.2f}%\n'
         f'Strategy: {matched_strategy}\n\n'
         'Historical stats:\n'
@@ -232,10 +257,13 @@ def broadcast_new_signals():
         ls.max_leverage, ls.matched_strategy, ls.historical_trades, ls.historical_winrate,
         ls.historical_avg_pnl, ls.historical_median_pnl, ls.historical_worst_pnl, ls.current_return_pct,
         ls.cluster_name, ls.cluster_risk, ls.reversal_from_peak_pct, ls.max_pump_pct, ls.live_snapshots,
+        ls.liquidation_price, ls.reward_pct, ls.risk_pct, ls.reward_risk,
         pst.virtual_position_usdt, pst.virtual_balance_at_open
     FROM live_signals ls
     LEFT JOIN paper_signal_trades pst ON pst.signal_id = ls.id
     WHERE COALESCE(ls.sent_to_telegram, false) = false
+      AND COALESCE(ls.signal_status, 'OPEN') <> 'CANCELLED'
+      AND COALESCE(ls.reason, '') NOT LIKE '%%CANCELLED_QUALITY_GATE%%'
       AND ls.created_at >= NOW() - (%s || ' minutes')::interval
     ORDER BY ls.confidence_pct DESC NULLS LAST,
              ls.historical_avg_pnl DESC NULLS LAST,
@@ -267,7 +295,7 @@ def update_open_paper_trades():
     SELECT
         pst.id, pst.signal_id, pst.token_id, UPPER(pst.side),
         pst.entry_price, pst.take_profit_price, pst.stop_loss_price,
-        pst.max_leverage, pst.virtual_position_usdt, ltf.current_price
+        pst.max_leverage, pst.virtual_position_usdt, pst.liquidation_price, ltf.current_price
     FROM paper_signal_trades pst
     LEFT JOIN live_token_features ltf ON ltf.token_id = pst.token_id
     WHERE pst.status = 'OPEN'
@@ -278,19 +306,23 @@ def update_open_paper_trades():
     rows = cur.fetchall()
     closed = 0
     for row in rows:
-        trade_id, signal_id, token_id, side, entry_price, tp, sl, max_leverage, position_usdt, current_price = row
+        trade_id, signal_id, token_id, side, entry_price, tp, sl, max_leverage, position_usdt, liquidation_price, current_price = row
         if current_price is None or entry_price is None or entry_price <= 0:
             continue
 
         close_reason = None
         if side == 'SHORT':
-            if tp is not None and current_price <= tp:
+            if liquidation_price is not None and current_price >= liquidation_price:
+                close_reason = 'LIQUIDATION'
+            elif tp is not None and current_price <= tp:
                 close_reason = 'TP'
             elif sl is not None and current_price >= sl:
                 close_reason = 'SL'
             pnl_pct = (entry_price / current_price - 1.0) * 100.0
         else:
-            if tp is not None and current_price >= tp:
+            if liquidation_price is not None and current_price <= liquidation_price:
+                close_reason = 'LIQUIDATION'
+            elif tp is not None and current_price >= tp:
                 close_reason = 'TP'
             elif sl is not None and current_price <= sl:
                 close_reason = 'SL'
@@ -334,6 +366,7 @@ def send_closed_trade_results():
         pst.id, pst.signal_id, pst.token_id, pst.mode, UPPER(pst.side), pst.confidence_pct,
         pst.entry_price, pst.close_price, pst.pnl_pct, pst.close_reason, pst.max_leverage,
         pst.opened_at, pst.closed_at, ls.cluster_name, ls.reversal_from_peak_pct,
+        pst.liquidation_price, pst.reward_pct, pst.risk_pct, pst.reward_risk,
         pst.virtual_position_usdt, pst.virtual_pnl_usdt, pst.virtual_balance_after_close
     FROM paper_signal_trades pst
     LEFT JOIN live_signals ls ON ls.id = pst.signal_id
@@ -349,12 +382,17 @@ def send_closed_trade_results():
             trade_id, signal_id, token_id, mode, side, confidence_pct,
             entry_price, close_price, pnl_pct, close_reason, max_leverage,
             opened_at, closed_at, cluster_name, setup_move_pct,
+            liquidation_price, reward_pct, risk_pct, reward_risk,
             virtual_position_usdt, virtual_pnl_usdt, balance_after,
         ) = row
 
         token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
         setup_label = 'Drawdown' if side == 'LONG' else 'Reversal from peak'
-        result_label = 'TAKE PROFIT' if close_reason == 'TP' else 'STOP LOSS'
+        result_label = {
+            'TP': 'TAKE PROFIT',
+            'SL': 'STOP LOSS',
+            'LIQUIDATION': 'LIQUIDATION',
+        }.get(close_reason, close_reason or 'CLOSED')
         text = (
             f'PAPER TRADE CLOSED: {result_label}\n\n'
             f'Token: {token_url}\n'
@@ -367,6 +405,9 @@ def send_closed_trade_results():
             f'Leverage: x{max_leverage:g}\n\n'
             f'Entry: {fmt_price(entry_price)}\n'
             f'Close: {fmt_price(close_price)}\n'
+            f'Liquidation: {fmt_liquidation(liquidation_price, max_leverage)}\n'
+            f'Reward/Risk: {(reward_risk or 0):.2f} '
+            f'({(reward_pct or 0):.2f}% / {(risk_pct or 0):.2f}%)\n'
             f'Paper PnL: {pnl_pct:.2f}%\n'
             f'Virtual position: {fmt_money(virtual_position_usdt)}\n'
             f'Virtual PnL: {fmt_money(virtual_pnl_usdt)}\n'

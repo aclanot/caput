@@ -67,6 +67,12 @@ def column_exists(cur, table_name, column_name):
     return cur.fetchone() is not None
 
 
+def ensure_live_signal_columns(cur):
+    if not table_exists(cur, 'live_signals'):
+        return
+    cur.execute("ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS signal_status TEXT DEFAULT 'OPEN'")
+
+
 def existing_tables(table_names):
     cur = conn.cursor()
     return [name for name in table_names if table_exists(cur, name)]
@@ -187,6 +193,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Caput bot online\n\n'
         '/status - collector and dataset status\n'
         '/summary - compact live and strategy summary\n'
+        '/health - pipeline freshness and skip diagnostics\n'
         '/calls [long|short] [limit] - best recent live calls\n'
         '/paper [limit] - latest live paper trades\n'
         '/sweep [long|short] [limit] - best historical strategies\n'
@@ -264,6 +271,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f'{label}: {cur.fetchone()[0]}')
 
     if table_exists(cur, 'live_signals'):
+        ensure_live_signal_columns(cur)
         lines.extend(['', 'Recent calls by side:'])
         cur.execute('''
         SELECT UPPER(COALESCE(side, 'UNKNOWN')) AS side,
@@ -273,6 +281,8 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
                MAX(created_at) AS last_created
         FROM live_signals
         WHERE created_at >= NOW() - interval '24 hours'
+          AND COALESCE(signal_status, 'OPEN') <> 'CANCELLED'
+          AND COALESCE(reason, '') NOT LIKE '%%CANCELLED_QUALITY_GATE%%'
         GROUP BY UPPER(COALESCE(side, 'UNKNOWN'))
         ORDER BY max_conf DESC NULLS LAST, n DESC
         ''')
@@ -319,11 +329,191 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_text(update, '\n'.join(lines))
 
 
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    feature_stale = int(os.getenv('LIVE_FEATURES_STALE_SECONDS', '60'))
+    signal_stale = int(os.getenv('LIVE_SIGNALS_STALE_SECONDS', '60'))
+    min_signal_snapshots = int(os.getenv('LIVE_SIGNALS_MIN_SNAPSHOTS', '3'))
+    min_trades = int(os.getenv('LIVE_SIGNALS_MIN_TRADES', '50'))
+    min_winrate = float(os.getenv('LIVE_SIGNALS_MIN_WINRATE', '0.55'))
+    min_expectancy = float(os.getenv('LIVE_SIGNALS_MIN_EXPECTANCY', '5'))
+    long_min_trades = int(os.getenv('LIVE_SIGNALS_LONG_MIN_TRADES', '50'))
+    long_min_winrate = float(os.getenv('LIVE_SIGNALS_LONG_MIN_WINRATE', '0.55'))
+    long_min_expectancy = float(os.getenv('LIVE_SIGNALS_LONG_MIN_EXPECTANCY', '5'))
+    min_median = float(os.getenv('LIVE_SIGNALS_MIN_MEDIAN_PNL', '5'))
+    max_worst = float(os.getenv('LIVE_SIGNALS_MAX_WORST_PNL', '-70'))
+    max_stop_distance = float(os.getenv('LIVE_SIGNALS_MAX_STOP_DISTANCE_PCT', '120'))
+    min_reward_risk = float(os.getenv('LIVE_SIGNALS_MIN_REWARD_RISK', '0.35'))
+
+    lines = ['Health', '']
+
+    if table_exists(cur, 'token_snapshots'):
+        cur.execute("SELECT COUNT(*), MAX(ts) FROM token_snapshots WHERE ts >= NOW() - interval '1 minute'")
+        snapshots_1m, last_snapshot = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM token_snapshots WHERE ts >= NOW() - interval '5 minutes'")
+        snapshots_5m = cur.fetchone()[0]
+        cur.execute('''
+        SELECT COUNT(*)
+        FROM (
+            SELECT token_id
+            FROM token_snapshots
+            WHERE ts >= NOW() - interval '10 minutes'
+            GROUP BY token_id
+            HAVING COUNT(*) >= 2
+        ) t
+        ''')
+        tokens_2 = cur.fetchone()[0]
+        cur.execute('''
+        SELECT COUNT(*)
+        FROM (
+            SELECT token_id
+            FROM token_snapshots
+            WHERE ts >= NOW() - interval '10 minutes'
+            GROUP BY token_id
+            HAVING COUNT(*) >= %s
+        ) t
+        ''', (min_signal_snapshots,))
+        tokens_min = cur.fetchone()[0]
+        lines.append(f'Snapshots 1m: {snapshots_1m}')
+        lines.append(f'Snapshots 5m: {snapshots_5m}')
+        lines.append(f'Last snapshot: {last_snapshot}')
+        lines.append(f'Tokens with 2 snapshots/10m: {tokens_2}')
+        lines.append(f'Tokens with {min_signal_snapshots} snapshots/10m: {tokens_min}')
+
+    if table_exists(cur, 'live_token_features'):
+        cur.execute('''
+        SELECT COUNT(*)
+        FROM live_token_features
+        WHERE last_seen >= NOW() - (%s || ' seconds')::interval
+        ''', (feature_stale,))
+        fresh_features = cur.fetchone()[0]
+        cur.execute('SELECT COUNT(*), MAX(updated_at) FROM live_token_features')
+        feature_total, feature_updated = cur.fetchone()
+        lines.extend([
+            '',
+            f'Live features fresh {feature_stale}s: {fresh_features}',
+            f'Live features total: {feature_total}',
+            f'Features last updated: {feature_updated}',
+        ])
+
+    if table_exists(cur, 'strategy_sweep'):
+        lines.extend([
+            '',
+            'Quality gates:',
+            f'SHORT trades>={min_trades} win>={min_winrate*100:.1f}% avg>={min_expectancy:.2f}%',
+            f'LONG trades>={long_min_trades} win>={long_min_winrate*100:.1f}% avg>={long_min_expectancy:.2f}%',
+            f'median>={min_median:.2f}% worst>={max_worst:.2f}% stop<={max_stop_distance:.2f}% rr>={min_reward_risk:.2f}',
+        ])
+        cur.execute('''
+        SELECT UPPER(side), COUNT(*)
+        FROM strategy_sweep
+        WHERE (
+            UPPER(side) = 'SHORT'
+            AND trades >= %s
+            AND winrate >= %s
+            AND avg_pnl >= %s
+        ) OR (
+            UPPER(side) = 'LONG'
+            AND trades >= %s
+            AND winrate >= %s
+            AND avg_pnl >= %s
+        )
+        GROUP BY UPPER(side)
+        ORDER BY UPPER(side)
+        ''', (min_trades, min_winrate, min_expectancy, long_min_trades, long_min_winrate, long_min_expectancy))
+        rows = cur.fetchall()
+        lines.extend(['', 'Eligible strategies:'])
+        if rows:
+            for side, count in rows:
+                lines.append(f'{side}: {count}')
+        else:
+            lines.append('none')
+
+    if table_exists(cur, 'live_token_features') and table_exists(cur, 'strategy_sweep'):
+        cur.execute('''
+        SELECT UPPER(ss.side), COUNT(*)
+        FROM live_token_features lf
+        JOIN strategy_sweep ss ON UPPER(ss.mode) = UPPER(lf.mode)
+        WHERE lf.last_seen >= NOW() - (%s || ' seconds')::interval
+          AND (
+              (
+                  UPPER(ss.side) = 'SHORT'
+                  AND ss.trades >= %s
+                  AND ss.winrate >= %s
+                  AND ss.avg_pnl >= %s
+              )
+              OR (
+                  UPPER(ss.side) = 'LONG'
+                  AND ss.trades >= %s
+                  AND ss.winrate >= %s
+                  AND ss.avg_pnl >= %s
+              )
+          )
+        GROUP BY UPPER(ss.side)
+        ORDER BY UPPER(ss.side)
+        ''', (
+            signal_stale,
+            min_trades, min_winrate, min_expectancy,
+            long_min_trades, long_min_winrate, long_min_expectancy,
+        ))
+        rows = cur.fetchall()
+        lines.extend(['', f'Joined candidates fresh {signal_stale}s:'])
+        if rows:
+            for side, count in rows:
+                lines.append(f'{side}: {count}')
+        else:
+            lines.append('none')
+
+    if table_exists(cur, 'signal_debug_log'):
+        cur.execute('''
+        SELECT status, COUNT(*), MAX(ts)
+        FROM signal_debug_log
+        WHERE ts >= NOW() - interval '30 minutes'
+        GROUP BY status
+        ORDER BY COUNT(*) DESC
+        LIMIT 8
+        ''')
+        rows = cur.fetchall()
+        lines.extend(['', 'Signal skips 30m:'])
+        if rows:
+            for status_name, count, last_ts in rows:
+                lines.append(f'{status_name}: {count} last={last_ts}')
+        else:
+            lines.append('none')
+
+    if table_exists(cur, 'live_signals'):
+        ensure_live_signal_columns(cur)
+        cur.execute('''
+        SELECT COUNT(*), MAX(created_at)
+        FROM live_signals
+        WHERE created_at >= NOW() - interval '30 minutes'
+          AND COALESCE(signal_status, 'OPEN') <> 'CANCELLED'
+          AND COALESCE(reason, '') NOT LIKE '%%CANCELLED_QUALITY_GATE%%'
+        ''')
+        signal_count, last_signal = cur.fetchone()
+        lines.extend(['', f'Signals 30m: {signal_count}', f'Last signal: {last_signal}'])
+
+    if table_exists(cur, 'paper_signal_trades'):
+        cur.execute("SELECT status, COUNT(*) FROM paper_signal_trades GROUP BY status ORDER BY status")
+        rows = cur.fetchall()
+        lines.extend(['', 'Paper trades:'])
+        for status_name, count in rows:
+            lines.append(f'{status_name}: {count}')
+
+    collector_log = latest_collector_log(cur)
+    if collector_log:
+        log_ts, log_status, log_note = collector_log
+        lines.extend(['', f'Collector: {log_ts} | {log_status} | {(log_note or "")[:500]}'])
+
+    await reply_text(update, '\n'.join(lines))
+
+
 async def calls_for_side(update: Update, context: ContextTypes.DEFAULT_TYPE, forced_side=None):
     cur = conn.cursor()
     if not table_exists(cur, 'live_signals'):
         await update.message.reply_text('live_signals table does not exist yet.')
         return
+    ensure_live_signal_columns(cur)
 
     limit = arg_limit(context)
     side = forced_side or arg_side(context)
@@ -334,13 +524,23 @@ async def calls_for_side(update: Update, context: ContextTypes.DEFAULT_TYPE, for
         params.append(side)
     params.append(limit)
 
+    has_risk = column_exists(cur, 'live_signals', 'reward_risk')
+    risk_select = (
+        'liquidation_price, reward_pct, risk_pct, reward_risk,'
+        if has_risk else
+        'NULL::double precision AS liquidation_price, NULL::double precision AS reward_pct, '
+        'NULL::double precision AS risk_pct, NULL::double precision AS reward_risk,'
+    )
     cur.execute(f'''
     SELECT token_id, mode, UPPER(side), confidence_pct, current_price,
            take_profit_price, stop_loss_price, matched_strategy,
+           {risk_select}
            historical_trades, historical_winrate, historical_avg_pnl,
            cluster_name, cluster_risk, reversal_from_peak_pct, created_at
     FROM live_signals
     WHERE created_at >= NOW() - interval '24 hours'
+      AND COALESCE(signal_status, 'OPEN') <> 'CANCELLED'
+      AND COALESCE(reason, '') NOT LIKE '%%CANCELLED_QUALITY_GATE%%'
       {side_sql}
     ORDER BY confidence_pct DESC NULLS LAST,
              historical_avg_pnl DESC NULLS LAST,
@@ -357,13 +557,15 @@ async def calls_for_side(update: Update, context: ContextTypes.DEFAULT_TYPE, for
     for row in rows:
         (
             token_id, mode, row_side, confidence_pct, current_price,
-            tp, sl, strategy, trades, winrate, avg_pnl,
+            tp, sl, strategy, liquidation_price, reward_pct, risk_pct, reward_risk,
+            trades, winrate, avg_pnl,
             cluster_name, cluster_risk, setup_move, created_at,
         ) = row
         setup_label = 'drawdown' if row_side == 'LONG' else 'reversal'
         lines.append(
             f'{row_side} {mode} conf={confidence_pct}% avg={avg_pnl:.2f}% win={winrate*100:.1f}% n={trades}\n'
-            f'{token_id} price={fmt_price(current_price)} tp={fmt_price(tp)} sl={fmt_price(sl)} {setup_label}={(setup_move or 0):.2f}%\n'
+            f'{token_id} price={fmt_price(current_price)} tp={fmt_price(tp)} sl={fmt_price(sl)} liq={fmt_price(liquidation_price)}\n'
+            f'rr={(reward_risk or 0):.2f} reward={(reward_pct or 0):.2f}% risk={(risk_pct or 0):.2f}% {setup_label}={(setup_move or 0):.2f}%\n'
             f'{strategy} | {cluster_name or "n/a"}/{cluster_risk or "n/a"} | {created_at}'
         )
         lines.append('')
@@ -391,21 +593,30 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     limit = arg_limit(context)
     has_virtual = column_exists(cur, 'paper_signal_trades', 'virtual_position_usdt')
+    has_risk = column_exists(cur, 'paper_signal_trades', 'reward_risk')
+    risk_select = (
+        'liquidation_price, reward_pct, risk_pct, reward_risk,'
+        if has_risk else
+        'NULL::double precision AS liquidation_price, NULL::double precision AS reward_pct, '
+        'NULL::double precision AS risk_pct, NULL::double precision AS reward_risk,'
+    )
     if has_virtual:
-        cur.execute('''
+        cur.execute(f'''
         SELECT token_id, mode, UPPER(side), status, confidence_pct,
                entry_price, take_profit_price, stop_loss_price, close_price,
                pnl_pct, close_reason, opened_at, closed_at,
+               {risk_select}
                virtual_position_usdt, virtual_pnl_usdt, virtual_balance_after_close
         FROM paper_signal_trades
         ORDER BY COALESCE(closed_at, opened_at) DESC NULLS LAST, id DESC
         LIMIT %s
         ''', (limit,))
     else:
-        cur.execute('''
+        cur.execute(f'''
         SELECT token_id, mode, UPPER(side), status, confidence_pct,
                entry_price, take_profit_price, stop_loss_price, close_price,
                pnl_pct, close_reason, opened_at, closed_at,
+               {risk_select}
                NULL, NULL, NULL
         FROM paper_signal_trades
         ORDER BY COALESCE(closed_at, opened_at) DESC NULLS LAST, id DESC
@@ -421,12 +632,14 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (
             token_id, mode, side, status_name, confidence_pct,
             entry, tp, sl, close, pnl, close_reason, opened_at, closed_at,
+            liquidation_price, reward_pct, risk_pct, reward_risk,
             virtual_position, virtual_pnl, virtual_balance_after,
         ) = row
         lines.append(
             f'{side} {mode} {status_name} conf={confidence_pct}% pnl={fmt_pct(pnl)} reason={close_reason or "open"}\n'
             f'virtual_position={fmt_money(virtual_position)} virtual_pnl={fmt_money(virtual_pnl)} balance_after={fmt_money(virtual_balance_after)}\n'
-            f'{token_id} entry={fmt_price(entry)} tp={fmt_price(tp)} sl={fmt_price(sl)} close={fmt_price(close)}\n'
+            f'{token_id} entry={fmt_price(entry)} tp={fmt_price(tp)} sl={fmt_price(sl)} liq={fmt_price(liquidation_price)} close={fmt_price(close)}\n'
+            f'rr={(reward_risk or 0):.2f} reward={(reward_pct or 0):.2f}% risk={(risk_pct or 0):.2f}%\n'
             f'opened={opened_at} closed={closed_at}'
         )
         lines.append('')
@@ -568,6 +781,7 @@ app.add_handler(CommandHandler('start', start))
 app.add_handler(CommandHandler('status', status))
 app.add_handler(CommandHandler('stats', status))
 app.add_handler(CommandHandler('summary', summary))
+app.add_handler(CommandHandler('health', health))
 app.add_handler(CommandHandler('calls', calls))
 app.add_handler(CommandHandler('long', long_calls))
 app.add_handler(CommandHandler('short', short_calls))

@@ -7,16 +7,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL')
-STALE_SECONDS = int(os.getenv('LIVE_SIGNALS_STALE_SECONDS', '15'))
+STALE_SECONDS = int(os.getenv('LIVE_SIGNALS_STALE_SECONDS', '60'))
 MAX_AGE_SECONDS = float(os.getenv('LIVE_SIGNALS_MAX_AGE_SECONDS', '900'))
 MIN_SNAPSHOTS = int(os.getenv('LIVE_SIGNALS_MIN_SNAPSHOTS', '3'))
 MIN_TRADES = int(os.getenv('LIVE_SIGNALS_MIN_TRADES', '50'))
 MIN_WINRATE = float(os.getenv('LIVE_SIGNALS_MIN_WINRATE', '0.55'))
 MIN_EXPECTANCY = float(os.getenv('LIVE_SIGNALS_MIN_EXPECTANCY', '5'))
 MIN_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_MIN_CONFIDENCE', '65'))
-LONG_MIN_TRADES = int(os.getenv('LIVE_SIGNALS_LONG_MIN_TRADES', '30'))
-LONG_MIN_WINRATE = float(os.getenv('LIVE_SIGNALS_LONG_MIN_WINRATE', '0.70'))
-LONG_MIN_EXPECTANCY = float(os.getenv('LIVE_SIGNALS_LONG_MIN_EXPECTANCY', '0'))
+MIN_MEDIAN_PNL = float(os.getenv('LIVE_SIGNALS_MIN_MEDIAN_PNL', '5'))
+MAX_WORST_PNL = float(os.getenv('LIVE_SIGNALS_MAX_WORST_PNL', '-70'))
+MAX_STOP_DISTANCE_PCT = float(os.getenv('LIVE_SIGNALS_MAX_STOP_DISTANCE_PCT', '120'))
+MIN_REWARD_RISK = float(os.getenv('LIVE_SIGNALS_MIN_REWARD_RISK', '0.35'))
+SHORT_MIN_CURRENT_RETURN_PCT = float(os.getenv('LIVE_SIGNALS_SHORT_MIN_CURRENT_RETURN_PCT', '10'))
+LONG_MIN_TRADES = int(os.getenv('LIVE_SIGNALS_LONG_MIN_TRADES', '50'))
+LONG_MIN_WINRATE = float(os.getenv('LIVE_SIGNALS_LONG_MIN_WINRATE', '0.55'))
+LONG_MIN_EXPECTANCY = float(os.getenv('LIVE_SIGNALS_LONG_MIN_EXPECTANCY', '5'))
 LONG_MIN_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_LONG_MIN_CONFIDENCE', str(MIN_CONFIDENCE)))
 MIN_PUMP = float(os.getenv('LIVE_SIGNALS_MIN_PUMP_FOR_REVERSAL_PCT', '50'))
 MIN_REVERSAL = float(os.getenv('LIVE_SIGNALS_MIN_REVERSAL_FROM_PEAK_PCT', '12'))
@@ -24,6 +29,9 @@ SHORT_TP_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_TP_PCT', '30'))
 SHORT_SL_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_SL_PCT', '35'))
 LONG_TP_PCT = float(os.getenv('LIVE_SIGNAL_LONG_TP_PCT', '20'))
 LONG_SL_PCT = float(os.getenv('LIVE_SIGNAL_LONG_SL_PCT', '25'))
+MAX_STRATEGIES_PER_TOKEN_SIDE = int(os.getenv('LIVE_SIGNALS_MAX_STRATEGIES_PER_TOKEN_SIDE', '5'))
+DEBUG_LOG_LIMIT_PER_STATUS = int(os.getenv('LIVE_SIGNALS_DEBUG_LOG_LIMIT_PER_STATUS', '5'))
+SKIP_SCHEMA_ENSURE = os.getenv('LIVE_SIGNALS_SKIP_SCHEMA_ENSURE', 'false').lower() in ('1', 'true', 'yes', 'on')
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -31,6 +39,7 @@ if not DATABASE_URL:
 conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 cur = conn.cursor()
+debug_examples = {}
 
 
 def utcnow():
@@ -39,6 +48,11 @@ def utcnow():
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
+
+def execute_ddl_batch(statements):
+    if statements:
+        cur.execute(';\n'.join(statements) + ';')
 
 
 def ensure_schema():
@@ -69,7 +83,7 @@ def ensure_schema():
         created_at TIMESTAMP
     )
     ''')
-    for ddl in [
+    execute_ddl_batch([
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS live_snapshots INT',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS max_pump_pct DOUBLE PRECISION',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reversal_from_peak_pct DOUBLE PRECISION',
@@ -77,8 +91,12 @@ def ensure_schema():
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_risk TEXT',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS adaptive_adjustment INT DEFAULT 0',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS adaptive_reason TEXT',
-    ]:
-        cur.execute(ddl)
+        "ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS signal_status TEXT DEFAULT 'OPEN'",
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS liquidation_price DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reward_pct DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
+    ])
 
     cur.execute('''
     CREATE TABLE IF NOT EXISTS paper_signal_trades (
@@ -100,6 +118,12 @@ def ensure_schema():
         close_reason TEXT
     )
     ''')
+    execute_ddl_batch([
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS liquidation_price DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_pct DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
+    ])
     cur.execute('''
     CREATE TABLE IF NOT EXISTS signal_debug_log (
         id BIGSERIAL PRIMARY KEY,
@@ -110,6 +134,13 @@ def ensure_schema():
         note TEXT
     )
     ''')
+    execute_ddl_batch([
+        'CREATE INDEX IF NOT EXISTS idx_live_token_features_last_seen ON live_token_features(last_seen)',
+        'CREATE INDEX IF NOT EXISTS idx_live_token_features_mode_last_seen ON live_token_features(UPPER(mode), last_seen)',
+        'CREATE INDEX IF NOT EXISTS idx_strategy_sweep_mode_side_quality ON strategy_sweep(UPPER(mode), UPPER(side), trades, winrate, avg_pnl)',
+        'CREATE INDEX IF NOT EXISTS idx_live_signals_token_side_created ON live_signals(token_id, UPPER(side), created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_signal_debug_log_ts_status ON signal_debug_log(ts, status)',
+    ])
 
 
 def classify_short_cluster(max_pump, current_return, buy_sell_ratio, snapshots):
@@ -187,6 +218,14 @@ def leverage_for(conf, mode, side):
     return 1.0
 
 
+def liquidation_price_for(side, current_price, leverage):
+    if not leverage or leverage <= 1:
+        return None
+    if side == 'SHORT':
+        return current_price * (1.0 + 1.0 / leverage)
+    return current_price * (1.0 - 1.0 / leverage)
+
+
 def prices_for_signal(side, current_price, current_return_pct=None, strategy_tp=None, strategy_sl=None):
     entry_low = current_price * 0.98
     entry_high = current_price * 1.02
@@ -211,14 +250,44 @@ def prices_for_signal(side, current_price, current_return_pct=None, strategy_tp=
     return entry_low, entry_high, tp, sl
 
 
+def risk_metrics(side, current_price, take_profit_price, stop_loss_price):
+    if not current_price or current_price <= 0 or not take_profit_price or not stop_loss_price:
+        return None, None, None
+    if side == 'SHORT':
+        reward_pct = max(0, (current_price / take_profit_price - 1.0) * 100.0)
+        risk_pct = max(0, (stop_loss_price / current_price - 1.0) * 100.0)
+    else:
+        reward_pct = max(0, (take_profit_price / current_price - 1.0) * 100.0)
+        risk_pct = max(0, (current_price / stop_loss_price - 1.0) * 100.0)
+    reward_risk = reward_pct / risk_pct if risk_pct > 0 else None
+    return reward_pct, risk_pct, reward_risk
+
+
+def fmt_pct(value):
+    return 'n/a' if value is None else f'{float(value):.2f}%'
+
+
 def log_skip(token_id, mode, status, note):
-    cur.execute(
+    if DEBUG_LOG_LIMIT_PER_STATUS <= 0:
+        return
+    bucket = debug_examples.setdefault(status, [])
+    if len(bucket) >= DEBUG_LOG_LIMIT_PER_STATUS:
+        return
+    bucket.append((utcnow(), str(token_id), mode, status, note[:1000]))
+
+
+def flush_debug_examples():
+    rows = [row for bucket in debug_examples.values() for row in bucket]
+    if not rows:
+        return
+    cur.executemany(
         'INSERT INTO signal_debug_log(ts, token_id, mode, status, note) VALUES (%s,%s,%s,%s,%s)',
-        (utcnow(), str(token_id), mode, status, note[:1000]),
+        rows,
     )
 
 
-ensure_schema()
+if not SKIP_SCHEMA_ENSURE:
+    ensure_schema()
 cur.execute('DELETE FROM live_signals WHERE created_at < NOW() - interval \'1 day\'')
 
 cur.execute('''
@@ -233,6 +302,8 @@ FROM strategy_sweep
 WHERE trades >= %s
   AND winrate >= %s
   AND avg_pnl >= %s
+  AND median_pnl >= %s
+  AND worst_pnl >= %s
   AND UPPER(side) = 'SHORT'
 GROUP BY UPPER(side)
 UNION ALL
@@ -241,59 +312,85 @@ FROM strategy_sweep
 WHERE trades >= %s
   AND winrate >= %s
   AND avg_pnl >= %s
+  AND median_pnl >= %s
+  AND worst_pnl >= %s
   AND UPPER(side) = 'LONG'
 GROUP BY UPPER(side)
 ''', (
-    MIN_TRADES, MIN_WINRATE, MIN_EXPECTANCY,
-    LONG_MIN_TRADES, LONG_MIN_WINRATE, LONG_MIN_EXPECTANCY,
+    MIN_TRADES, MIN_WINRATE, MIN_EXPECTANCY, MIN_MEDIAN_PNL, MAX_WORST_PNL,
+    LONG_MIN_TRADES, LONG_MIN_WINRATE, LONG_MIN_EXPECTANCY, MIN_MEDIAN_PNL, MAX_WORST_PNL,
 ))
 strategy_counts = {side: count for side, count in cur.fetchall()}
 strategy_count = sum(strategy_counts.values())
 
 cur.execute('''
+WITH candidate_base AS (
+    SELECT
+        lf.token_id,
+        UPPER(COALESCE(lf.mode, 'UNKNOWN')) AS mode,
+        lf.current_price,
+        lf.current_return_pct,
+        lf.max_pump_pct,
+        lf.max_drawdown_pct,
+        lf.age_seconds,
+        lf.snapshots,
+        lf.buy_sell_ratio,
+        UPPER(ss.side) AS side,
+        ss.strategy,
+        ss.entry_threshold,
+        ss.take_profit,
+        ss.stop_loss,
+        ss.trades,
+        ss.winrate,
+        ss.avg_pnl,
+        ss.median_pnl,
+        ss.worst_pnl,
+        ROW_NUMBER() OVER (
+            PARTITION BY lf.token_id, UPPER(ss.side)
+            ORDER BY ss.avg_pnl DESC, ss.winrate DESC, ss.trades DESC, ss.median_pnl DESC
+        ) AS strategy_rank
+    FROM live_token_features lf
+    JOIN strategy_sweep ss ON UPPER(ss.mode) = UPPER(lf.mode)
+    WHERE lf.last_seen >= NOW() - (%s || ' seconds')::interval
+      AND lf.age_seconds <= %s
+      AND lf.current_price IS NOT NULL
+      AND lf.current_return_pct IS NOT NULL
+      AND lf.max_pump_pct IS NOT NULL
+      AND ss.median_pnl >= %s
+      AND ss.worst_pnl >= %s
+      AND (
+          (
+              UPPER(ss.side) = 'SHORT'
+              AND ss.trades >= %s
+              AND ss.winrate >= %s
+              AND ss.avg_pnl >= %s
+              AND lf.current_return_pct >= %s
+              AND lf.max_pump_pct >= %s
+              AND (lf.max_pump_pct - lf.current_return_pct) >= %s
+              AND lf.max_pump_pct >= ((ss.entry_threshold - 1.0) * 100.0)
+          )
+          OR (
+              UPPER(ss.side) = 'LONG'
+              AND ss.trades >= %s
+              AND ss.winrate >= %s
+              AND ss.avg_pnl >= %s
+              AND lf.max_drawdown_pct IS NOT NULL
+              AND lf.current_return_pct <= ((ss.entry_threshold - 1.0) * 100.0)
+          )
+      )
+)
 SELECT
-    lf.token_id,
-    UPPER(COALESCE(lf.mode, 'UNKNOWN')) AS mode,
-    lf.current_price,
-    lf.current_return_pct,
-    lf.max_pump_pct,
-    lf.max_drawdown_pct,
-    lf.age_seconds,
-    lf.snapshots,
-    lf.buy_sell_ratio,
-    UPPER(ss.side) AS side,
-    ss.strategy,
-    ss.entry_threshold,
-    ss.take_profit,
-    ss.stop_loss,
-    ss.trades,
-    ss.winrate,
-    ss.avg_pnl,
-    ss.median_pnl,
-    ss.worst_pnl
-FROM live_token_features lf
-JOIN strategy_sweep ss ON UPPER(ss.mode) = UPPER(lf.mode)
-WHERE lf.last_seen >= NOW() - (%s || ' seconds')::interval
-  AND lf.age_seconds <= %s
-  AND (
-      (
-          UPPER(ss.side) = 'SHORT'
-          AND ss.trades >= %s
-          AND ss.winrate >= %s
-          AND ss.avg_pnl >= %s
-      )
-      OR (
-          UPPER(ss.side) = 'LONG'
-          AND ss.trades >= %s
-          AND ss.winrate >= %s
-          AND ss.avg_pnl >= %s
-      )
-  )
-ORDER BY ss.avg_pnl DESC, ss.winrate DESC, ss.trades DESC, lf.last_seen DESC
+    token_id, mode, current_price, current_return_pct, max_pump_pct, max_drawdown_pct,
+    age_seconds, snapshots, buy_sell_ratio, side, strategy, entry_threshold, take_profit,
+    stop_loss, trades, winrate, avg_pnl, median_pnl, worst_pnl
+FROM candidate_base
+WHERE strategy_rank <= %s
+ORDER BY avg_pnl DESC, winrate DESC, trades DESC, token_id, side, strategy_rank
 ''', (
-    STALE_SECONDS, MAX_AGE_SECONDS,
-    MIN_TRADES, MIN_WINRATE, MIN_EXPECTANCY,
+    STALE_SECONDS, MAX_AGE_SECONDS, MIN_MEDIAN_PNL, MAX_WORST_PNL,
+    MIN_TRADES, MIN_WINRATE, MIN_EXPECTANCY, SHORT_MIN_CURRENT_RETURN_PCT, MIN_PUMP, MIN_REVERSAL,
     LONG_MIN_TRADES, LONG_MIN_WINRATE, LONG_MIN_EXPECTANCY,
+    MAX_STRATEGIES_PER_TOKEN_SIDE,
 ))
 rows = cur.fetchall()
 
@@ -332,6 +429,9 @@ for row in rows:
         setup_move = max_pump - current_return
         cluster_name, cluster_risk = classify_short_cluster(max_pump, current_return, bsr, snapshots)
 
+        if current_return < SHORT_MIN_CURRENT_RETURN_PCT:
+            skip('current_return_too_low', f'current={current_return:.2f}% min={SHORT_MIN_CURRENT_RETURN_PCT:.2f}%')
+            continue
         if cluster_risk == 'DANGEROUS_SHORT':
             skip('dangerous_runner_cluster', f'{cluster_name}; pump={max_pump:.2f}; reversal={setup_move:.2f}')
             continue
@@ -359,6 +459,24 @@ for row in rows:
         skip('unsupported_side')
         continue
 
+    entry_low, entry_high, tp, sl = prices_for_signal(side, current_price, current_return, take_profit, stop_loss)
+    reward_pct, risk_pct, reward_risk = risk_metrics(side, current_price, tp, sl)
+    if avg_pnl is None or avg_pnl < (LONG_MIN_EXPECTANCY if side == 'LONG' else MIN_EXPECTANCY):
+        skip('low_expectancy', f'avg={fmt_pct(avg_pnl)}')
+        continue
+    if med_pnl is None or med_pnl < MIN_MEDIAN_PNL:
+        skip('low_median_pnl', f'median={fmt_pct(med_pnl)}')
+        continue
+    if worst_pnl is None or worst_pnl < MAX_WORST_PNL:
+        skip('worst_pnl_too_bad', f'worst={fmt_pct(worst_pnl)}')
+        continue
+    if risk_pct is None or risk_pct > MAX_STOP_DISTANCE_PCT:
+        skip('stop_too_far', f'risk={fmt_pct(risk_pct)} max={MAX_STOP_DISTANCE_PCT:.2f}%')
+        continue
+    if reward_risk is None or reward_risk < MIN_REWARD_RISK:
+        skip('bad_reward_risk', f'rr={reward_risk if reward_risk is not None else "n/a"} min={MIN_REWARD_RISK:.2f}')
+        continue
+
     conf = confidence(winrate, avg_pnl, med_pnl, worst_pnl, trades, mode, side, cluster_risk, setup_move)
     min_confidence = LONG_MIN_CONFIDENCE if side == 'LONG' else MIN_CONFIDENCE
     if conf < min_confidence:
@@ -368,20 +486,30 @@ for row in rows:
     cur.execute('''
     SELECT 1 FROM live_signals
     WHERE token_id = %s AND UPPER(side) = %s AND created_at >= NOW() - interval '30 minutes'
+      AND COALESCE(signal_status, 'OPEN') <> 'CANCELLED'
+      AND COALESCE(reason, '') NOT LIKE '%%CANCELLED_QUALITY_GATE%%'
     LIMIT 1
     ''', (token_id, side))
     if cur.fetchone():
         skip('duplicate_recent')
         continue
 
-    entry_low, entry_high, tp, sl = prices_for_signal(side, current_price, current_return, take_profit, stop_loss)
     lev = leverage_for(conf, mode, side)
+    liquidation_price = liquidation_price_for(side, current_price, lev)
+    if liquidation_price is not None:
+        if side == 'SHORT' and sl >= liquidation_price:
+            skip('stop_after_liquidation', f'sl={sl:.8f} liquidation={liquidation_price:.8f}')
+            continue
+        if side == 'LONG' and sl <= liquidation_price:
+            skip('stop_after_liquidation', f'sl={sl:.8f} liquidation={liquidation_price:.8f}')
+            continue
     label = 'HIGH' if conf >= 80 else 'MEDIUM' if conf >= 65 else 'LOW'
     bounce_note = bounce_from_low if side == 'LONG' else setup_move
     reason = (
         f'{mode} {strategy} cluster={cluster_name}/{cluster_risk} '
-        f'current={current_return:.2f}% max_pump={max_pump:.2f}% max_dd={max_dd:.2f}% '
+        f'current={current_return:.2f}% max_pump={max_pump:.2f}% max_dd={fmt_pct(max_dd)} '
         f'setup_move={setup_move:.2f}% bounce_from_low={bounce_note:.2f}% '
+        f'reward={reward_pct:.2f}% risk={risk_pct:.2f}% rr={reward_risk:.2f} '
         f'snapshots={snapshots} historical_winrate={winrate*100:.1f}% avg={avg_pnl:.2f}% trades={trades}'
     )
 
@@ -391,10 +519,10 @@ for row in rows:
         current_price, entry_low, entry_high, take_profit_price, stop_loss_price, max_leverage,
         current_return_pct, matched_strategy,
         historical_trades, historical_winrate, historical_avg_pnl, historical_median_pnl,
-        historical_worst_pnl, reason, created_at,
+        historical_worst_pnl, reason, created_at, signal_status,
         live_snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk,
-        adaptive_adjustment, adaptive_reason
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'v2_no_adaptive_yet')
+        adaptive_adjustment, adaptive_reason, liquidation_price, reward_pct, risk_pct, reward_risk
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,0,'v2_no_adaptive_yet',%s,%s,%s,%s)
     RETURNING id
     ''', (
         token_id, mode, side, f'{side}_SIGNAL', label, conf,
@@ -402,18 +530,24 @@ for row in rows:
         current_return, strategy,
         trades, winrate, avg_pnl, med_pnl, worst_pnl, reason, utcnow(),
         snapshots, max_pump, setup_move, cluster_name, cluster_risk,
+        liquidation_price, reward_pct, risk_pct, reward_risk,
     ))
     signal_id = cur.fetchone()[0]
 
     cur.execute('''
     INSERT INTO paper_signal_trades(
         signal_id, token_id, mode, side, status, confidence_pct,
-        entry_price, take_profit_price, stop_loss_price, max_leverage, opened_at
-    ) VALUES (%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s)
+        entry_price, take_profit_price, stop_loss_price, max_leverage, opened_at,
+        liquidation_price, reward_pct, risk_pct, reward_risk
+    ) VALUES (%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     ON CONFLICT(signal_id) DO NOTHING
-    ''', (signal_id, token_id, mode, side, conf, current_price, tp, sl, lev, utcnow()))
+    ''', (
+        signal_id, token_id, mode, side, conf, current_price, tp, sl, lev, utcnow(),
+        liquidation_price, reward_pct, risk_pct, reward_risk,
+    ))
     created += 1
 
+flush_debug_examples()
 print(f'live signals created: {created}', flush=True)
 if skipped:
     print('signal skips:', ', '.join(f'{k}={v}' for k, v in sorted(skipped.items())), flush=True)
@@ -424,6 +558,8 @@ cur.execute('''
 SELECT token_id, mode, side, confidence_pct, current_price, take_profit_price, stop_loss_price,
        matched_strategy, cluster_name, reversal_from_peak_pct
 FROM live_signals
+WHERE COALESCE(signal_status, 'OPEN') <> 'CANCELLED'
+  AND COALESCE(reason, '') NOT LIKE '%CANCELLED_QUALITY_GATE%'
 ORDER BY confidence_pct DESC NULLS LAST, historical_avg_pnl DESC NULLS LAST, id DESC
 LIMIT 20
 ''')
