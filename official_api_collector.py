@@ -13,7 +13,7 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 API_URL = os.getenv('CATAPULT_API_URL', 'https://public-api.catapult.trade/graphql').strip()
 API_KEY = os.getenv('CATAPULT_API_KEY', '').strip()
 API_INTERVAL_SECONDS = float(os.getenv('API_COLLECTOR_INTERVAL_SECONDS', '10'))
-API_LIMIT = float(os.getenv('API_COLLECTOR_LIMIT', '100'))
+API_LIMIT = int(os.getenv('API_COLLECTOR_LIMIT', '100'))
 API_SPEED_MODE = os.getenv('API_COLLECTOR_SPEED_MODE', '').strip().upper()
 API_SORT_FIELD = os.getenv('API_COLLECTOR_SORT_FIELD', 'StartTime').strip()
 API_SORT_DIRECTION = os.getenv('API_COLLECTOR_SORT_DIRECTION', 'Desc').strip()
@@ -111,6 +111,11 @@ CREATE TABLE IF NOT EXISTS official_api_collector_log (
     note TEXT
 )
 ''')
+cur.execute('ALTER TABLE official_api_collector_log ADD COLUMN IF NOT EXISTS status TEXT')
+cur.execute('ALTER TABLE official_api_collector_log ADD COLUMN IF NOT EXISTS note TEXT')
+cur.execute('ALTER TABLE official_api_collector_log ADD COLUMN IF NOT EXISTS event_type TEXT')
+cur.execute('ALTER TABLE official_api_collector_log ADD COLUMN IF NOT EXISTS error_message TEXT')
+cur.execute('ALTER TABLE official_api_collector_log ALTER COLUMN event_type DROP NOT NULL')
 
 cur.execute('CREATE INDEX IF NOT EXISTS idx_token_snapshots_token_ts ON token_snapshots(token_id, ts)')
 cur.execute('CREATE INDEX IF NOT EXISTS idx_token_snapshots_ts ON token_snapshots(ts)')
@@ -256,16 +261,19 @@ def fetch_and_save_cycle():
     total_saved = 0
     pages = 0
     last_has_next = None
+    had_error = False
 
     for page_index in range(API_PAGES_PER_CYCLE):
         response = fetch_tokens(after_cursor=after_cursor)
         if response.status_code != 200:
             log_status(f'http_{response.status_code}', response.text[:500])
+            had_error = True
             break
 
         data = response.json()
         if data.get('errors'):
             log_status('graphql_errors', json.dumps(data.get('errors'))[:500])
+            had_error = True
             break
 
         tokens = data.get('data', {}).get('tokens') or {}
@@ -284,7 +292,10 @@ def fetch_and_save_cycle():
         if page_index + 1 < API_PAGES_PER_CYCLE:
             time.sleep(API_PAGE_SLEEP_SECONDS)
 
-    log_status('saved', f'pages={pages} items={total_items} snapshots={total_saved} hasNext={last_has_next}')
+    if had_error:
+        log_status('cycle_failed', f'pages={pages} items={total_items} snapshots={total_saved} hasNext={last_has_next}')
+    else:
+        log_status('saved', f'pages={pages} items={total_items} snapshots={total_saved} hasNext={last_has_next}')
 
 
 def main():

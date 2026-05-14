@@ -10,8 +10,12 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 MIN_SIGNAL_TRADES = int(os.getenv('LIVE_SIGNALS_MIN_TRADES', '50'))
 MIN_SIGNAL_WINRATE = float(os.getenv('LIVE_SIGNALS_MIN_WINRATE', '0.55'))
 MIN_SIGNAL_EXPECTANCY = float(os.getenv('LIVE_SIGNALS_MIN_EXPECTANCY', '5'))
+LONG_MIN_SIGNAL_TRADES = int(os.getenv('LIVE_SIGNALS_LONG_MIN_TRADES', '30'))
+LONG_MIN_SIGNAL_WINRATE = float(os.getenv('LIVE_SIGNALS_LONG_MIN_WINRATE', '0.70'))
+LONG_MIN_SIGNAL_EXPECTANCY = float(os.getenv('LIVE_SIGNALS_LONG_MIN_EXPECTANCY', '0'))
 MAX_SIGNAL_AGE_SECONDS = float(os.getenv('LIVE_SIGNALS_MAX_AGE_SECONDS', '300'))
 MIN_SIGNAL_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_MIN_CONFIDENCE', '60'))
+LONG_MIN_SIGNAL_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_LONG_MIN_CONFIDENCE', str(MIN_SIGNAL_CONFIDENCE)))
 MIN_REVERSAL_FROM_PEAK_PCT = float(os.getenv('LIVE_SIGNALS_MIN_REVERSAL_FROM_PEAK_PCT', '20'))
 MIN_PUMP_FOR_REVERSAL_PCT = float(os.getenv('LIVE_SIGNALS_MIN_PUMP_FOR_REVERSAL_PCT', '50'))
 MIN_LIVE_SNAPSHOTS_FOR_SIGNAL = int(os.getenv('LIVE_SIGNALS_MIN_SNAPSHOTS', '3'))
@@ -144,6 +148,22 @@ def classify_live_cluster(current_return_pct, max_pump_pct, max_drawdown_pct, re
     return 'mixed_live', 'NEUTRAL'
 
 
+def classify_long_cluster(current_return_pct, max_drawdown_pct, buy_sell_ratio, snapshots):
+    drawdown = max(0, -(current_return_pct or 0))
+    max_drawdown_abs = max(0, -(max_drawdown_pct or current_return_pct or 0))
+    bounce_from_low = (current_return_pct - max_drawdown_pct) if max_drawdown_pct is not None else 0
+
+    if drawdown >= 90 and (buy_sell_ratio is None or buy_sell_ratio < 0.8):
+        return 'capitulation_falling_live', 'HIGH_RISK_LONG'
+    if max_drawdown_abs >= 80 and bounce_from_low >= 10:
+        return 'deep_bounce_live', 'GOOD_LONG'
+    if drawdown >= 70 and buy_sell_ratio is not None and buy_sell_ratio >= 1.2 and snapshots >= 3:
+        return 'deep_drawdown_buying_live', 'GOOD_LONG'
+    if drawdown >= 50:
+        return 'deep_drawdown_live', 'OK_LONG'
+    return 'mixed_live', 'NEUTRAL'
+
+
 def cluster_adjustment(cluster_name, cluster_risk):
     if cluster_risk == 'GOOD_SHORT':
         return 12
@@ -151,6 +171,12 @@ def cluster_adjustment(cluster_name, cluster_risk):
         return 5
     if cluster_risk == 'DANGEROUS_SHORT':
         return -30
+    if cluster_risk == 'GOOD_LONG':
+        return 10
+    if cluster_risk == 'OK_LONG':
+        return 5
+    if cluster_risk == 'HIGH_RISK_LONG':
+        return -12
     return 0
 
 
@@ -243,17 +269,29 @@ def max_leverage_for(confidence_pct, mode, side, cluster_risk):
     return 1.0
 
 
-def prices_for_signal(side, current_price):
+def prices_for_signal(side, current_price, current_return_pct=None, strategy_tp=None, strategy_sl=None):
     if current_price is None or current_price <= 0:
         return None, None, None, None
     entry_low = current_price * 0.98
     entry_high = current_price * 1.02
     if side == 'SHORT':
-        tp = current_price * (1.0 - DEFAULT_SHORT_TP_PCT / 100.0)
-        sl = current_price * (1.0 + DEFAULT_SHORT_SL_PCT / 100.0)
+        tp = None
+        sl = None
+        if current_return_pct is not None and current_return_pct > -99:
+            initial_price = current_price / (1.0 + current_return_pct / 100.0)
+            if strategy_tp and 0 < strategy_tp < 1:
+                tp = initial_price * strategy_tp
+            if strategy_sl and strategy_sl > 1:
+                sl = initial_price * strategy_sl
+        if tp is None or tp >= current_price:
+            tp = current_price * (1.0 - DEFAULT_SHORT_TP_PCT / 100.0)
+        if sl is None or sl <= current_price:
+            sl = current_price * (1.0 + DEFAULT_SHORT_SL_PCT / 100.0)
     else:
-        tp = current_price * (1.0 + DEFAULT_LONG_TP_PCT / 100.0)
-        sl = current_price * (1.0 - DEFAULT_LONG_SL_PCT / 100.0)
+        tp_mult = strategy_tp if strategy_tp and strategy_tp > 1 else 1.0 + DEFAULT_LONG_TP_PCT / 100.0
+        sl_mult = strategy_sl if strategy_sl and 0 < strategy_sl < 1 else 1.0 - DEFAULT_LONG_SL_PCT / 100.0
+        tp = current_price * tp_mult
+        sl = current_price * sl_mult
     return entry_low, entry_high, tp, sl
 
 
@@ -272,14 +310,28 @@ SELECT
     ss.side, ss.strategy, ss.entry_threshold, ss.take_profit, ss.stop_loss,
     ss.trades, ss.winrate, ss.avg_pnl, ss.median_pnl, ss.worst_pnl
 FROM live_token_features lf
-JOIN strategy_sweep ss ON ss.mode = lf.mode
+JOIN strategy_sweep ss ON UPPER(ss.mode) = UPPER(lf.mode)
 WHERE lf.age_seconds <= %s
-  AND ss.trades >= %s
-  AND ss.winrate >= %s
-  AND ss.avg_pnl >= %s
-  AND ss.side = 'SHORT'
-ORDER BY ss.avg_pnl DESC
-''', (MAX_SIGNAL_AGE_SECONDS, MIN_SIGNAL_TRADES, MIN_SIGNAL_WINRATE, MIN_SIGNAL_EXPECTANCY))
+  AND (
+      (
+          UPPER(ss.side) = 'SHORT'
+          AND ss.trades >= %s
+          AND ss.winrate >= %s
+          AND ss.avg_pnl >= %s
+      )
+      OR (
+          UPPER(ss.side) = 'LONG'
+          AND ss.trades >= %s
+          AND ss.winrate >= %s
+          AND ss.avg_pnl >= %s
+      )
+  )
+ORDER BY ss.avg_pnl DESC, ss.winrate DESC, ss.trades DESC
+''', (
+    MAX_SIGNAL_AGE_SECONDS,
+    MIN_SIGNAL_TRADES, MIN_SIGNAL_WINRATE, MIN_SIGNAL_EXPECTANCY,
+    LONG_MIN_SIGNAL_TRADES, LONG_MIN_SIGNAL_WINRATE, LONG_MIN_SIGNAL_EXPECTANCY,
+))
 
 rows = cur.fetchall()
 created = 0
@@ -292,6 +344,8 @@ for row in rows:
         side, strategy, entry_threshold, take_profit, stop_loss,
         trades, winrate, avg_pnl, median_pnl, worst_pnl,
     ) = row
+    side = (side or '').upper()
+    mode = (mode or 'UNKNOWN').upper()
 
     if current_return_pct is None or current_price is None or max_pump_pct is None:
         skipped['missing_price'] = skipped.get('missing_price', 0) + 1
@@ -301,31 +355,46 @@ for row in rows:
         skipped['too_few_snapshots'] = skipped.get('too_few_snapshots', 0) + 1
         continue
 
-    reversal_from_peak_pct = max_pump_pct - current_return_pct
-    cluster_name, cluster_risk = classify_live_cluster(
-        current_return_pct, max_pump_pct, max_drawdown_pct, reversal_from_peak_pct, buy_sell_ratio, snapshots
-    )
+    threshold_pct = (entry_threshold - 1.0) * 100.0
+    if side == 'SHORT':
+        setup_move_pct = max_pump_pct - current_return_pct
+        cluster_name, cluster_risk = classify_live_cluster(
+            current_return_pct, max_pump_pct, max_drawdown_pct, setup_move_pct, buy_sell_ratio, snapshots
+        )
 
-    if cluster_risk == 'DANGEROUS_SHORT':
-        skipped['dangerous_runner_cluster'] = skipped.get('dangerous_runner_cluster', 0) + 1
-        log_skip(token_id, mode, 'skip_runner', f'{cluster_name}; pump={max_pump_pct:.2f}; reversal={reversal_from_peak_pct:.2f}')
-        continue
-
-    if max_pump_pct < MIN_PUMP_FOR_REVERSAL_PCT:
-        skipped['pump_too_small'] = skipped.get('pump_too_small', 0) + 1
-        continue
-
-    if reversal_from_peak_pct < MIN_REVERSAL_FROM_PEAK_PCT:
-        if not (ALLOW_NO_REVERSAL_FOR_CRACK and mode == 'CRACK'):
-            skipped['no_reversal_yet'] = skipped.get('no_reversal_yet', 0) + 1
+        if cluster_risk == 'DANGEROUS_SHORT':
+            skipped['short_dangerous_runner_cluster'] = skipped.get('short_dangerous_runner_cluster', 0) + 1
+            log_skip(token_id, mode, 'skip_runner', f'{cluster_name}; pump={max_pump_pct:.2f}; reversal={setup_move_pct:.2f}')
             continue
 
-    threshold_pct = (entry_threshold - 1.0) * 100.0
-    if max_pump_pct < threshold_pct:
-        skipped['strategy_threshold_not_met'] = skipped.get('strategy_threshold_not_met', 0) + 1
+        if max_pump_pct < MIN_PUMP_FOR_REVERSAL_PCT:
+            skipped['short_pump_too_small'] = skipped.get('short_pump_too_small', 0) + 1
+            continue
+
+        if setup_move_pct < MIN_REVERSAL_FROM_PEAK_PCT:
+            if not (ALLOW_NO_REVERSAL_FOR_CRACK and mode == 'CRACK'):
+                skipped['short_no_reversal_yet'] = skipped.get('short_no_reversal_yet', 0) + 1
+                continue
+
+        if max_pump_pct < threshold_pct:
+            skipped['short_strategy_threshold_not_met'] = skipped.get('short_strategy_threshold_not_met', 0) + 1
+            continue
+    elif side == 'LONG':
+        if max_drawdown_pct is None:
+            skipped['long_missing_drawdown'] = skipped.get('long_missing_drawdown', 0) + 1
+            continue
+
+        setup_move_pct = max(0, -current_return_pct)
+        cluster_name, cluster_risk = classify_long_cluster(current_return_pct, max_drawdown_pct, buy_sell_ratio, snapshots)
+
+        if current_return_pct > threshold_pct:
+            skipped['long_strategy_threshold_not_met'] = skipped.get('long_strategy_threshold_not_met', 0) + 1
+            continue
+    else:
+        skipped['unsupported_side'] = skipped.get('unsupported_side', 0) + 1
         continue
 
-    base_conf = confidence_score(winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side, cluster_name, cluster_risk, reversal_from_peak_pct)
+    base_conf = confidence_score(winrate, avg_pnl, median_pnl, worst_pnl, trades, mode, side, cluster_name, cluster_risk, setup_move_pct)
     adaptive_adj, adaptive_reason = live_performance_adjustment(mode, cluster_name, cluster_risk)
     if adaptive_adj <= -100:
         skipped['adaptive_disabled_setup'] = skipped.get('adaptive_disabled_setup', 0) + 1
@@ -333,20 +402,23 @@ for row in rows:
         continue
 
     conf_pct = int(round(clamp(base_conf + adaptive_adj, 1, 99)))
-    if conf_pct < MIN_SIGNAL_CONFIDENCE:
+    min_confidence = LONG_MIN_SIGNAL_CONFIDENCE if side == 'LONG' else MIN_SIGNAL_CONFIDENCE
+    if conf_pct < min_confidence:
         skipped['low_confidence'] = skipped.get('low_confidence', 0) + 1
         continue
 
     cur.execute('''
     SELECT 1 FROM live_signals
-    WHERE token_id = %s AND side = %s AND created_at >= NOW() - interval '30 minutes'
+    WHERE token_id = %s AND UPPER(side) = %s AND created_at >= NOW() - interval '30 minutes'
     LIMIT 1
     ''', (token_id, side))
     if cur.fetchone():
         skipped['duplicate_recent'] = skipped.get('duplicate_recent', 0) + 1
         continue
 
-    entry_low, entry_high, tp_price, sl_price = prices_for_signal(side, current_price)
+    entry_low, entry_high, tp_price, sl_price = prices_for_signal(
+        side, current_price, current_return_pct, take_profit, stop_loss
+    )
     max_lev = max_leverage_for(conf_pct, mode, side, cluster_risk)
     if max_lev <= 0:
         skipped['zero_leverage'] = skipped.get('zero_leverage', 0) + 1
@@ -359,7 +431,7 @@ for row in rows:
         f'{mode} matched {strategy} | cluster={cluster_name}/{cluster_risk} | '
         f'base_conf={base_conf}% adaptive_adj={adaptive_adj} | adaptive={adaptive_reason} | '
         f'current={current_return_pct:.2f}% | max_pump={max_pump_pct:.2f}% | '
-        f'reversal={reversal_from_peak_pct:.2f}% | snapshots={snapshots} | '
+        f'setup_move={setup_move_pct:.2f}% | snapshots={snapshots} | '
         f'historical winrate={winrate*100:.1f}% | avg={avg_pnl:.2f}% | '
         f'median={median_pnl:.2f}% | worst={worst_pnl:.2f}% | trades={trades} | url={url}'
     )
@@ -380,7 +452,7 @@ for row in rows:
         current_price, entry_low, entry_high, tp_price, sl_price, max_lev,
         current_return_pct, strategy,
         trades, winrate, avg_pnl, median_pnl, worst_pnl, reason, utcnow(),
-        snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk,
+        snapshots, max_pump_pct, setup_move_pct, cluster_name, cluster_risk,
         adaptive_adj, adaptive_reason,
     ))
     signal_id = cur.fetchone()[0]
@@ -404,7 +476,7 @@ SELECT token_id, mode, side, confidence_pct, current_price, entry_low, entry_hig
        historical_winrate, historical_avg_pnl, cluster_name, reversal_from_peak_pct,
        adaptive_adjustment
 FROM live_signals
-ORDER BY id DESC
+ORDER BY confidence_pct DESC NULLS LAST, historical_avg_pnl DESC NULLS LAST, id DESC
 LIMIT 20
 ''')
 
@@ -413,6 +485,6 @@ for row in cur.fetchall():
         f'{row[0]} {row[1]} {row[2]} conf={row[3]}% price={row[4]:.6f} '
         f'entry={row[5]:.6f}-{row[6]:.6f} tp={row[7]:.6f} sl={row[8]:.6f} '
         f'lev=x{row[9]} strategy={row[10]} win={row[11]*100:.1f}% avg={row[12]:.2f}% '
-        f'cluster={row[13]} reversal={row[14]:.2f}% adaptive={row[15]}',
+        f'cluster={row[13]} setup={row[14]:.2f}% adaptive={row[15]}',
         flush=True,
     )

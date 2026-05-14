@@ -13,6 +13,8 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 SIGNAL_CHAT_ID = os.getenv('TELEGRAM_SIGNAL_CHAT_ID')
 INTERVAL_SECONDS = float(os.getenv('SIGNAL_BROADCASTER_INTERVAL_SECONDS', '10'))
 MAX_SIGNAL_AGE_MINUTES = int(os.getenv('SIGNAL_BROADCASTER_MAX_SIGNAL_AGE_MINUTES', '60'))
+PAPER_START_BALANCE_USDT = float(os.getenv('PAPER_START_BALANCE_USDT', '1000'))
+PAPER_TRADE_SIZE_USDT = float(os.getenv('PAPER_TRADE_SIZE_USDT', '100'))
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -31,14 +33,120 @@ def utcnow():
 
 
 def ensure_schema():
-    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS sent_to_telegram BOOLEAN DEFAULT FALSE')
-    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT')
-    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_name TEXT')
-    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_risk TEXT')
-    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reversal_from_peak_pct DOUBLE PRECISION')
-    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS max_pump_pct DOUBLE PRECISION')
-    cur.execute('ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS live_snapshots INT')
-    cur.execute('ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS result_sent_to_telegram BOOLEAN DEFAULT FALSE')
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS live_signals (
+        id BIGSERIAL PRIMARY KEY,
+        token_id TEXT,
+        mode TEXT,
+        side TEXT,
+        signal_type TEXT,
+        confidence TEXT,
+        confidence_pct INT,
+        current_price DOUBLE PRECISION,
+        entry_low DOUBLE PRECISION,
+        entry_high DOUBLE PRECISION,
+        take_profit_price DOUBLE PRECISION,
+        stop_loss_price DOUBLE PRECISION,
+        max_leverage DOUBLE PRECISION,
+        current_return_pct DOUBLE PRECISION,
+        matched_strategy TEXT,
+        historical_trades INT,
+        historical_winrate DOUBLE PRECISION,
+        historical_avg_pnl DOUBLE PRECISION,
+        historical_median_pnl DOUBLE PRECISION,
+        historical_worst_pnl DOUBLE PRECISION,
+        reason TEXT,
+        sent_to_telegram BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP
+    )
+    ''')
+    for ddl in [
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS sent_to_telegram BOOLEAN DEFAULT FALSE',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_name TEXT',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS cluster_risk TEXT',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reversal_from_peak_pct DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS max_pump_pct DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS live_snapshots INT',
+    ]:
+        cur.execute(ddl)
+
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS paper_signal_trades (
+        id BIGSERIAL PRIMARY KEY,
+        signal_id BIGINT UNIQUE,
+        token_id TEXT,
+        mode TEXT,
+        side TEXT,
+        status TEXT,
+        confidence_pct INT,
+        entry_price DOUBLE PRECISION,
+        take_profit_price DOUBLE PRECISION,
+        stop_loss_price DOUBLE PRECISION,
+        max_leverage DOUBLE PRECISION,
+        opened_at TIMESTAMP,
+        closed_at TIMESTAMP,
+        close_price DOUBLE PRECISION,
+        pnl_pct DOUBLE PRECISION,
+        close_reason TEXT
+    )
+    ''')
+    for ddl in [
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS result_sent_to_telegram BOOLEAN DEFAULT FALSE',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_position_usdt DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_balance_at_open DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_pnl_usdt DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_balance_after_close DOUBLE PRECISION',
+    ]:
+        cur.execute(ddl)
+
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS paper_account (
+        account_key TEXT PRIMARY KEY,
+        balance_usdt DOUBLE PRECISION,
+        updated_at TIMESTAMP
+    )
+    ''')
+    cur.execute('''
+    INSERT INTO paper_account(account_key, balance_usdt, updated_at)
+    VALUES ('default', %s, %s)
+    ON CONFLICT(account_key) DO NOTHING
+    ''', (PAPER_START_BALANCE_USDT, utcnow()))
+
+
+def account_balance():
+    cur.execute("SELECT balance_usdt FROM paper_account WHERE account_key = 'default'")
+    row = cur.fetchone()
+    if row:
+        return float(row[0])
+    cur.execute('''
+    INSERT INTO paper_account(account_key, balance_usdt, updated_at)
+    VALUES ('default', %s, %s)
+    RETURNING balance_usdt
+    ''', (PAPER_START_BALANCE_USDT, utcnow()))
+    return float(cur.fetchone()[0])
+
+
+def fill_missing_virtual_open_fields():
+    balance = account_balance()
+    cur.execute('''
+    UPDATE paper_signal_trades
+    SET virtual_position_usdt = COALESCE(virtual_position_usdt, %s),
+        virtual_balance_at_open = COALESCE(virtual_balance_at_open, %s)
+    WHERE status = 'OPEN'
+      AND (virtual_position_usdt IS NULL OR virtual_balance_at_open IS NULL)
+    ''', (PAPER_TRADE_SIZE_USDT, balance))
+
+
+def update_account_balance(delta_usdt):
+    balance = account_balance()
+    new_balance = balance + delta_usdt
+    cur.execute('''
+    UPDATE paper_account
+    SET balance_usdt = %s, updated_at = %s
+    WHERE account_key = 'default'
+    ''', (new_balance, utcnow()))
+    return new_balance
 
 
 def tg_send(text):
@@ -58,11 +166,18 @@ def tg_send(text):
 def fmt_price(value):
     if value is None:
         return 'n/a'
+    value = float(value)
     if abs(value) >= 100:
         return f'{value:.2f}'
     if abs(value) >= 1:
         return f'{value:.4f}'
     return f'{value:.8f}'
+
+
+def fmt_money(value):
+    if value is None:
+        return 'n/a'
+    return f'${float(value):.2f}'
 
 
 def signal_message(row):
@@ -71,23 +186,27 @@ def signal_message(row):
         current_price, entry_low, entry_high, take_profit_price, stop_loss_price,
         max_leverage, matched_strategy, historical_trades, historical_winrate,
         historical_avg_pnl, historical_median_pnl, historical_worst_pnl, current_return_pct,
-        cluster_name, cluster_risk, reversal_from_peak_pct, max_pump_pct, live_snapshots,
+        cluster_name, cluster_risk, setup_move_pct, max_pump_pct, live_snapshots,
+        virtual_position_usdt, virtual_balance_at_open,
     ) = row
 
     token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
+    setup_label = 'Drawdown' if side == 'LONG' else 'Reversal from peak'
 
     return (
-        '🚨 PAPER SIGNAL\n\n'
+        'PAPER SIGNAL OPENED\n\n'
         f'Token: {token_url}\n'
         f'Type: {side}\n'
         f'Mode: {mode}\n'
         f'Confidence: {confidence_pct}%\n'
-        f'Max leverage: x{max_leverage:g}\n\n'
+        f'Max leverage: x{max_leverage:g}\n'
+        f'Virtual position: {fmt_money(virtual_position_usdt)}\n'
+        f'Virtual balance: {fmt_money(virtual_balance_at_open)}\n\n'
         f'Cluster: {cluster_name or "n/a"}\n'
         f'Cluster risk: {cluster_risk or "n/a"}\n'
         f'Snapshots: {live_snapshots or 0}\n'
         f'Max pump: {(max_pump_pct or 0):.2f}%\n'
-        f'Reversal from peak: {(reversal_from_peak_pct or 0):.2f}%\n\n'
+        f'{setup_label}: {(setup_move_pct or 0):.2f}%\n\n'
         f'Current price: {fmt_price(current_price)}\n'
         f'Entry: {fmt_price(entry_low)} - {fmt_price(entry_high)}\n'
         f'Take profit: {fmt_price(take_profit_price)}\n'
@@ -100,22 +219,28 @@ def signal_message(row):
         f'Avg pnl: {historical_avg_pnl:.2f}%\n'
         f'Median pnl: {historical_median_pnl:.2f}%\n'
         f'Worst pnl: {historical_worst_pnl:.2f}%\n\n'
-        f'Paper trade opened. Signal ID: {signal_id}'
+        f'Signal ID: {signal_id}'
     )
 
 
 def broadcast_new_signals():
+    fill_missing_virtual_open_fields()
     cur.execute('''
     SELECT
-        id, token_id, mode, side, confidence_pct,
-        current_price, entry_low, entry_high, take_profit_price, stop_loss_price,
-        max_leverage, matched_strategy, historical_trades, historical_winrate,
-        historical_avg_pnl, historical_median_pnl, historical_worst_pnl, current_return_pct,
-        cluster_name, cluster_risk, reversal_from_peak_pct, max_pump_pct, live_snapshots
-    FROM live_signals
-    WHERE COALESCE(sent_to_telegram, false) = false
-      AND created_at >= NOW() - (%s || ' minutes')::interval
-    ORDER BY confidence_pct DESC NULLS LAST, id ASC
+        ls.id, ls.token_id, ls.mode, ls.side, ls.confidence_pct,
+        ls.current_price, ls.entry_low, ls.entry_high, ls.take_profit_price, ls.stop_loss_price,
+        ls.max_leverage, ls.matched_strategy, ls.historical_trades, ls.historical_winrate,
+        ls.historical_avg_pnl, ls.historical_median_pnl, ls.historical_worst_pnl, ls.current_return_pct,
+        ls.cluster_name, ls.cluster_risk, ls.reversal_from_peak_pct, ls.max_pump_pct, ls.live_snapshots,
+        pst.virtual_position_usdt, pst.virtual_balance_at_open
+    FROM live_signals ls
+    LEFT JOIN paper_signal_trades pst ON pst.signal_id = ls.id
+    WHERE COALESCE(ls.sent_to_telegram, false) = false
+      AND ls.created_at >= NOW() - (%s || ' minutes')::interval
+    ORDER BY ls.confidence_pct DESC NULLS LAST,
+             ls.historical_avg_pnl DESC NULLS LAST,
+             ls.created_at ASC,
+             ls.id ASC
     LIMIT 10
     ''', (MAX_SIGNAL_AGE_MINUTES,))
 
@@ -137,11 +262,12 @@ def broadcast_new_signals():
 
 
 def update_open_paper_trades():
+    fill_missing_virtual_open_fields()
     cur.execute('''
     SELECT
-        pst.id, pst.signal_id, pst.token_id, pst.side,
+        pst.id, pst.signal_id, pst.token_id, UPPER(pst.side),
         pst.entry_price, pst.take_profit_price, pst.stop_loss_price,
-        pst.max_leverage, pst.opened_at, ltf.current_price
+        pst.max_leverage, pst.virtual_position_usdt, ltf.current_price
     FROM paper_signal_trades pst
     LEFT JOIN live_token_features ltf ON ltf.token_id = pst.token_id
     WHERE pst.status = 'OPEN'
@@ -152,7 +278,7 @@ def update_open_paper_trades():
     rows = cur.fetchall()
     closed = 0
     for row in rows:
-        trade_id, signal_id, token_id, side, entry_price, tp, sl, max_leverage, opened_at, current_price = row
+        trade_id, signal_id, token_id, side, entry_price, tp, sl, max_leverage, position_usdt, current_price = row
         if current_price is None or entry_price is None or entry_price <= 0:
             continue
 
@@ -173,23 +299,42 @@ def update_open_paper_trades():
         if not close_reason:
             continue
 
-        leveraged_pnl = pnl_pct * (max_leverage or 1.0)
+        leveraged_pnl_pct = pnl_pct * (max_leverage or 1.0)
+        position_usdt = float(position_usdt or PAPER_TRADE_SIZE_USDT)
+        virtual_pnl_usdt = position_usdt * leveraged_pnl_pct / 100.0
+        balance_after = update_account_balance(virtual_pnl_usdt)
+
         cur.execute('''
         UPDATE paper_signal_trades
-        SET status = 'CLOSED', closed_at = %s, close_price = %s, pnl_pct = %s, close_reason = %s
+        SET status = 'CLOSED',
+            closed_at = %s,
+            close_price = %s,
+            pnl_pct = %s,
+            close_reason = %s,
+            virtual_position_usdt = %s,
+            virtual_pnl_usdt = %s,
+            virtual_balance_after_close = %s
         WHERE id = %s
-        ''', (utcnow(), current_price, leveraged_pnl, close_reason, trade_id))
+        ''', (
+            utcnow(), current_price, leveraged_pnl_pct, close_reason,
+            position_usdt, virtual_pnl_usdt, balance_after, trade_id,
+        ))
         closed += 1
-        print(f'closed paper trade {trade_id} {close_reason} pnl={leveraged_pnl:.2f}%', flush=True)
+        print(
+            f'closed paper trade {trade_id} signal={signal_id} {close_reason} '
+            f'pnl={leveraged_pnl_pct:.2f}% virtual={virtual_pnl_usdt:.2f}',
+            flush=True,
+        )
     return closed
 
 
 def send_closed_trade_results():
     cur.execute('''
     SELECT
-        pst.id, pst.signal_id, pst.token_id, pst.mode, pst.side, pst.confidence_pct,
+        pst.id, pst.signal_id, pst.token_id, pst.mode, UPPER(pst.side), pst.confidence_pct,
         pst.entry_price, pst.close_price, pst.pnl_pct, pst.close_reason, pst.max_leverage,
-        pst.opened_at, pst.closed_at, ls.cluster_name, ls.reversal_from_peak_pct
+        pst.opened_at, pst.closed_at, ls.cluster_name, ls.reversal_from_peak_pct,
+        pst.virtual_position_usdt, pst.virtual_pnl_usdt, pst.virtual_balance_after_close
     FROM paper_signal_trades pst
     LEFT JOIN live_signals ls ON ls.id = pst.signal_id
     WHERE pst.status = 'CLOSED'
@@ -203,25 +348,29 @@ def send_closed_trade_results():
         (
             trade_id, signal_id, token_id, mode, side, confidence_pct,
             entry_price, close_price, pnl_pct, close_reason, max_leverage,
-            opened_at, closed_at, cluster_name, reversal_from_peak_pct,
+            opened_at, closed_at, cluster_name, setup_move_pct,
+            virtual_position_usdt, virtual_pnl_usdt, balance_after,
         ) = row
 
         token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
-        icon = '✅' if close_reason == 'TP' else '❌'
+        setup_label = 'Drawdown' if side == 'LONG' else 'Reversal from peak'
+        result_label = 'TAKE PROFIT' if close_reason == 'TP' else 'STOP LOSS'
         text = (
-            f'{icon} PAPER TRADE CLOSED\n\n'
+            f'PAPER TRADE CLOSED: {result_label}\n\n'
             f'Token: {token_url}\n'
             f'Signal ID: {signal_id}\n'
             f'Type: {side}\n'
             f'Mode: {mode}\n'
             f'Confidence: {confidence_pct}%\n'
             f'Cluster: {cluster_name or "n/a"}\n'
-            f'Reversal from peak: {(reversal_from_peak_pct or 0):.2f}%\n'
+            f'{setup_label}: {(setup_move_pct or 0):.2f}%\n'
             f'Leverage: x{max_leverage:g}\n\n'
             f'Entry: {fmt_price(entry_price)}\n'
             f'Close: {fmt_price(close_price)}\n'
-            f'Reason: {close_reason}\n'
-            f'Paper PnL: {pnl_pct:.2f}%\n\n'
+            f'Paper PnL: {pnl_pct:.2f}%\n'
+            f'Virtual position: {fmt_money(virtual_position_usdt)}\n'
+            f'Virtual PnL: {fmt_money(virtual_pnl_usdt)}\n'
+            f'Virtual balance: {fmt_money(balance_after)}\n\n'
             f'Opened: {opened_at}\n'
             f'Closed: {closed_at}'
         )
@@ -237,7 +386,11 @@ def send_closed_trade_results():
 def main():
     ensure_schema()
     print('signal broadcaster started', flush=True)
-    print(f'chat_id={SIGNAL_CHAT_ID} interval={INTERVAL_SECONDS}s', flush=True)
+    print(
+        f'chat_id={SIGNAL_CHAT_ID} interval={INTERVAL_SECONDS}s '
+        f'paper_start={PAPER_START_BALANCE_USDT} trade_size={PAPER_TRADE_SIZE_USDT}',
+        flush=True,
+    )
     while True:
         try:
             sent = broadcast_new_signals()
