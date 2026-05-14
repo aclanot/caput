@@ -288,6 +288,20 @@ def fmt_money(value):
     return f'${float(value):.2f}'
 
 
+def token_label(name, symbol, token_id):
+    if symbol and name:
+        return f'{symbol} ({name})'
+    if symbol:
+        return str(symbol)
+    if name:
+        return str(name)
+    return f'Token {token_id}'
+
+
+def token_url(token_id):
+    return f'https://catapult.trade/ru/turbo/tokens/{token_id}'
+
+
 async def reply_text(update, text):
     for start in range(0, len(text), 3900):
         await update.message.reply_text(text[start:start + 3900])
@@ -295,23 +309,17 @@ async def reply_text(update, text):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        'Caput bot online\n\n'
-        '/status - collector and dataset status\n'
-        '/summary - compact live and strategy summary\n'
-        '/health - pipeline freshness and skip diagnostics\n'
-        '/calls [long|short] [limit] - best recent live calls\n'
-        '/paper [limit] - latest live paper trades\n'
-        '/paper_account - virtual balance and auto trade settings\n'
-        '/paper_balance [amount] - set virtual balance\n'
-        '/paper_size [amount] - set max virtual position size\n'
-        '/paper_limits [max_open] [max_position_pct] - set paper risk limits\n'
-        '/paper_auto [on|off] - enable or disable auto paper opens\n'
-        '/paper_stats [days] - paper call winrate and PnL\n'
-        '/sweep [long|short] [limit] - best historical strategies\n'
-        '/backup - export DB CSV ZIP\n'
-        '/pg_dump_essential - smallest PostgreSQL dump, best for Telegram\n'
-        '/pg_dump_core - PostgreSQL dump without token_snapshots/logs\n'
-        '/pg_dump - full PostgreSQL dump, can be too large for Telegram'
+        'Caput bot\n\n'
+        '/calls - recent calls\n'
+        '/paper - open and latest paper trades\n'
+        '/stats or /paper_stats - winrate and PnL\n'
+        '/paper_account - virtual balance/settings\n'
+        '/paper_balance 1000 - set virtual balance\n'
+        '/paper_size 100 - set paper trade size\n'
+        '/paper_limits 10 10 - max open trades and max % balance\n'
+        '/paper_auto on|off - auto paper opens\n'
+        '/smart - adaptive learning status\n'
+        '/health - pipeline status'
     )
 
 
@@ -650,28 +658,19 @@ async def calls_for_side(update: Update, context: ContextTypes.DEFAULT_TYPE, for
         params.append(side)
     params.append(limit)
 
-    has_risk = column_exists(cur, 'live_signals', 'reward_risk')
-    risk_select = (
-        'liquidation_price, reward_pct, risk_pct, reward_risk,'
-        if has_risk else
-        'NULL::double precision AS liquidation_price, NULL::double precision AS reward_pct, '
-        'NULL::double precision AS risk_pct, NULL::double precision AS reward_risk,'
-    )
     cur.execute(f'''
-    SELECT token_id, mode, UPPER(side), confidence_pct, current_price,
-           take_profit_price, stop_loss_price, matched_strategy,
-           {risk_select}
-           historical_trades, historical_winrate, historical_avg_pnl,
-           cluster_name, cluster_risk, reversal_from_peak_pct, created_at
-    FROM live_signals
-    WHERE created_at >= NOW() - interval '24 hours'
-      AND COALESCE(signal_status, 'OPEN') <> 'CANCELLED'
-      AND COALESCE(reason, '') NOT LIKE '%%CANCELLED_QUALITY_GATE%%'
+    SELECT ls.token_id, os.name, os.symbol, ls.mode, UPPER(ls.side), ls.confidence_pct,
+           ls.current_price, ls.take_profit_price, ls.stop_loss_price, ls.created_at
+    FROM live_signals ls
+    LEFT JOIN official_api_token_state os ON os.token_id = ls.token_id
+    WHERE ls.created_at >= NOW() - interval '24 hours'
+      AND COALESCE(ls.signal_status, 'OPEN') <> 'CANCELLED'
+      AND COALESCE(ls.reason, '') NOT LIKE '%%CANCELLED_QUALITY_GATE%%'
       {side_sql}
-    ORDER BY confidence_pct DESC NULLS LAST,
-             historical_avg_pnl DESC NULLS LAST,
-             historical_winrate DESC NULLS LAST,
-             created_at DESC
+    ORDER BY ls.confidence_pct DESC NULLS LAST,
+             ls.historical_avg_pnl DESC NULLS LAST,
+             ls.historical_winrate DESC NULLS LAST,
+             ls.created_at DESC
     LIMIT %s
     ''', params)
     rows = cur.fetchall()
@@ -679,20 +678,17 @@ async def calls_for_side(update: Update, context: ContextTypes.DEFAULT_TYPE, for
         await update.message.reply_text('No recent calls found.')
         return
 
-    lines = [f'Calls top {len(rows)}' + (f' {side}' if side else ''), '']
+    lines = [f'Calls {len(rows)}' + (f' {side}' if side else ''), '']
     for row in rows:
         (
-            token_id, mode, row_side, confidence_pct, current_price,
-            tp, sl, strategy, liquidation_price, reward_pct, risk_pct, reward_risk,
-            trades, winrate, avg_pnl,
-            cluster_name, cluster_risk, setup_move, created_at,
+            token_id, name, symbol, mode, row_side, confidence_pct,
+            current_price, tp, sl, created_at,
         ) = row
-        setup_label = 'drawdown' if row_side == 'LONG' else 'reversal'
         lines.append(
-            f'{row_side} {mode} conf={confidence_pct}% avg={avg_pnl:.2f}% win={winrate*100:.1f}% n={trades}\n'
-            f'{token_id} price={fmt_price(current_price)} tp={fmt_price(tp)} sl={fmt_price(sl)} liq={fmt_price(liquidation_price)}\n'
-            f'rr={(reward_risk or 0):.2f} reward={(reward_pct or 0):.2f}% risk={(risk_pct or 0):.2f}% {setup_label}={(setup_move or 0):.2f}%\n'
-            f'{strategy} | {cluster_name or "n/a"}/{cluster_risk or "n/a"} | {created_at}'
+            f'{row_side} {mode} conf {confidence_pct}%\n'
+            f'{token_label(name, symbol, token_id)}\n'
+            f'Entry {fmt_price(current_price)} | TP {fmt_price(tp)} | SL {fmt_price(sl)}\n'
+            f'{token_url(token_id)}'
         )
         lines.append('')
 
@@ -719,55 +715,35 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     limit = arg_limit(context)
-    has_virtual = column_exists(cur, 'paper_signal_trades', 'virtual_position_usdt')
-    has_risk = column_exists(cur, 'paper_signal_trades', 'reward_risk')
-    risk_select = (
-        'liquidation_price, reward_pct, risk_pct, reward_risk,'
-        if has_risk else
-        'NULL::double precision AS liquidation_price, NULL::double precision AS reward_pct, '
-        'NULL::double precision AS risk_pct, NULL::double precision AS reward_risk,'
-    )
-    if has_virtual:
-        cur.execute(f'''
-        SELECT token_id, mode, UPPER(side), status, confidence_pct,
-               entry_price, take_profit_price, stop_loss_price, close_price,
-               pnl_pct, close_reason, opened_at, closed_at,
-               {risk_select}
-               virtual_position_usdt, virtual_pnl_usdt, virtual_balance_after_close
-        FROM paper_signal_trades
-        ORDER BY COALESCE(closed_at, opened_at) DESC NULLS LAST, id DESC
-        LIMIT %s
-        ''', (limit,))
-    else:
-        cur.execute(f'''
-        SELECT token_id, mode, UPPER(side), status, confidence_pct,
-               entry_price, take_profit_price, stop_loss_price, close_price,
-               pnl_pct, close_reason, opened_at, closed_at,
-               {risk_select}
-               NULL, NULL, NULL
-        FROM paper_signal_trades
-        ORDER BY COALESCE(closed_at, opened_at) DESC NULLS LAST, id DESC
-        LIMIT %s
-        ''', (limit,))
+    cur.execute('''
+    SELECT pst.signal_id, pst.token_id, os.name, os.symbol, pst.mode, UPPER(pst.side),
+           pst.status, pst.entry_price, pst.take_profit_price, pst.stop_loss_price,
+           pst.close_price, pst.pnl_pct, pst.close_reason,
+           pst.virtual_position_usdt, pst.virtual_pnl_usdt, pst.virtual_balance_after_close
+    FROM paper_signal_trades pst
+    LEFT JOIN official_api_token_state os ON os.token_id = pst.token_id
+    ORDER BY COALESCE(pst.closed_at, pst.opened_at) DESC NULLS LAST, pst.id DESC
+    LIMIT %s
+    ''', (limit,))
     rows = cur.fetchall()
     if not rows:
         await update.message.reply_text('No live paper trades yet.')
         return
 
-    lines = [f'Latest paper trades top {len(rows)}', '']
+    lines = [f'Paper trades {len(rows)}', '']
     for row in rows:
         (
-            token_id, mode, side, status_name, confidence_pct,
-            entry, tp, sl, close, pnl, close_reason, opened_at, closed_at,
-            liquidation_price, reward_pct, risk_pct, reward_risk,
+            signal_id, token_id, name, symbol, mode, side, status_name,
+            entry, tp, sl, close, pnl, close_reason,
             virtual_position, virtual_pnl, virtual_balance_after,
         ) = row
+        close_text = f'Close {fmt_price(close)} | PnL {fmt_pct(pnl)}' if close is not None else 'Still open'
         lines.append(
-            f'{side} {mode} {status_name} conf={confidence_pct}% pnl={fmt_pct(pnl)} reason={close_reason or "open"}\n'
-            f'virtual_position={fmt_money(virtual_position)} virtual_pnl={fmt_money(virtual_pnl)} balance_after={fmt_money(virtual_balance_after)}\n'
-            f'{token_id} entry={fmt_price(entry)} tp={fmt_price(tp)} sl={fmt_price(sl)} liq={fmt_price(liquidation_price)} close={fmt_price(close)}\n'
-            f'rr={(reward_risk or 0):.2f} reward={(reward_pct or 0):.2f}% risk={(risk_pct or 0):.2f}%\n'
-            f'opened={opened_at} closed={closed_at}'
+            f'#{signal_id} {status_name} {side} {mode}\n'
+            f'{token_label(name, symbol, token_id)}\n'
+            f'Entry {fmt_price(entry)} | TP {fmt_price(tp)} | SL {fmt_price(sl)}\n'
+            f'{close_text} | Size {fmt_money(virtual_position)}\n'
+            f'{token_url(token_id)}'
         )
         lines.append('')
 
@@ -797,17 +773,11 @@ async def paper_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         'Paper account\n\n'
-        f'Auto open: {"ON" if auto_open else "OFF"}\n'
-        f'Virtual balance: {fmt_money(balance)}\n'
-        f'Max trade size: {fmt_money(trade_size)}\n'
-        f'Effective next size: {fmt_money(effective_size)}\n'
-        f'Max open trades: {max_open}\n'
-        f'Max position pct: {max_position_pct:.2f}%\n'
-        f'Open trades: {open_count or 0}\n'
-        f'Open exposure: {fmt_money(open_exposure)}\n'
-        f'Closed trades: {closed_count or 0}\n'
-        f'Closed virtual PnL: {fmt_money(closed_pnl)}\n'
-        f'Updated: {updated_at}'
+        f'Auto: {"ON" if auto_open else "OFF"}\n'
+        f'Balance: {fmt_money(balance)}\n'
+        f'Next size: {fmt_money(effective_size)}\n'
+        f'Open: {open_count or 0}/{max_open} | Exposure: {fmt_money(open_exposure)}\n'
+        f'Closed: {closed_count or 0} | PnL: {fmt_money(closed_pnl)}'
     )
     await update.message.reply_text(text)
 
@@ -923,19 +893,20 @@ async def paper_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ''', (days,))
     closed, wins, losses, flat, avg_pnl, median_pnl, worst_pnl, best_pnl, virtual_pnl = cur.fetchone()
     winrate = (wins / closed * 100.0) if closed else 0
+    cur.execute("SELECT balance_usdt FROM paper_account WHERE account_key = 'default'")
+    balance_row = cur.fetchone()
+    balance = balance_row[0] if balance_row else None
+    cur.execute("SELECT COUNT(*) FROM paper_signal_trades WHERE status = 'OPEN'")
+    open_count = cur.fetchone()[0]
 
     lines = [
         f'Paper stats {days}d',
         '',
-        f'Closed calls: {closed or 0}',
-        f'Wins: {wins or 0}',
-        f'Losses: {losses or 0}',
-        f'Flat: {flat or 0}',
-        f'Winrate: {winrate:.1f}%',
-        f'Avg pnl: {fmt_pct(avg_pnl)}',
-        f'Median pnl: {fmt_pct(median_pnl)}',
-        f'Best pnl: {fmt_pct(best_pnl)}',
-        f'Worst pnl: {fmt_pct(worst_pnl)}',
+        f'Balance: {fmt_money(balance)}',
+        f'Open trades: {open_count or 0}',
+        f'Closed: {closed or 0}',
+        f'Winrate: {winrate:.1f}% ({wins or 0}W / {losses or 0}L)',
+        f'Avg: {fmt_pct(avg_pnl)} | Best: {fmt_pct(best_pnl)} | Worst: {fmt_pct(worst_pnl)}',
         f'Virtual PnL: {fmt_money(virtual_pnl)}',
     ]
 
@@ -968,9 +939,70 @@ async def paper_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ''', (days,))
     reason_rows = cur.fetchall()
     if reason_rows:
-        lines.extend(['', 'Close reasons:'])
+        lines.extend(['', 'Reasons:'])
         for close_reason, count in reason_rows:
             lines.append(f'{close_reason or "n/a"}: {count}')
+
+    await reply_text(update, '\n'.join(lines))
+
+
+async def smart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    ensure_paper_schema(cur)
+    if not table_exists(cur, 'live_signals'):
+        await update.message.reply_text('No live signals yet.')
+        return
+
+    days = int(os.getenv('LIVE_SIGNALS_ADAPTIVE_LOOKBACK_DAYS', '30'))
+    min_closed = int(os.getenv('LIVE_SIGNALS_ADAPTIVE_MIN_CLOSED_TRADES', '5'))
+    bad_win = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_WINRATE', '0.35'))
+    bad_avg = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_AVG_PNL', '-15'))
+    boost_win = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_BOOST_WINRATE', '0.60'))
+    boost_avg = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_BOOST_AVG_PNL', '5'))
+
+    cur.execute('''
+    SELECT
+        UPPER(ls.side) AS side,
+        UPPER(ls.mode) AS mode,
+        ls.matched_strategy,
+        COUNT(*) AS closed,
+        COUNT(*) FILTER (WHERE pst.pnl_pct > 0) AS wins,
+        AVG(pst.pnl_pct) AS avg_pnl
+    FROM paper_signal_trades pst
+    JOIN live_signals ls ON ls.id = pst.signal_id
+    WHERE pst.status = 'CLOSED'
+      AND pst.closed_at >= NOW() - (%s || ' days')::interval
+    GROUP BY UPPER(ls.side), UPPER(ls.mode), ls.matched_strategy
+    ORDER BY closed DESC, AVG(pst.pnl_pct) DESC NULLS LAST
+    LIMIT 12
+    ''', (days,))
+    rows = cur.fetchall()
+
+    lines = [
+        'Smart learning',
+        '',
+        f'Looks at last {days}d closed paper trades.',
+        f'Blocks after {min_closed}+ closes if win < {bad_win*100:.0f}% or avg < {bad_avg:.1f}%.',
+        f'Boosts if win >= {boost_win*100:.0f}% and avg >= {boost_avg:.1f}%.',
+        '',
+    ]
+
+    if not rows:
+        lines.append(f'No closed paper trades yet. It starts learning after {min_closed} closes.')
+    else:
+        for side, mode, strategy, closed, wins, avg_pnl in rows:
+            winrate = (wins / closed * 100.0) if closed else 0
+            avg = float(avg_pnl or 0)
+            if closed >= min_closed and (winrate < bad_win * 100.0 or avg < bad_avg):
+                state = 'BLOCK'
+            elif closed >= min_closed and winrate >= boost_win * 100.0 and avg >= boost_avg:
+                state = 'BOOST'
+            elif closed >= min_closed:
+                state = 'OK'
+            else:
+                state = 'LEARN'
+            lines.append(f'{state} {side} {mode} n={closed} win={winrate:.1f}% avg={avg:.2f}%')
+            lines.append(str(strategy or 'strategy n/a'))
 
     await reply_text(update, '\n'.join(lines))
 
@@ -1107,7 +1139,7 @@ async def pg_dump_essential(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler('start', start))
 app.add_handler(CommandHandler('status', status))
-app.add_handler(CommandHandler('stats', status))
+app.add_handler(CommandHandler('stats', paper_stats))
 app.add_handler(CommandHandler('summary', summary))
 app.add_handler(CommandHandler('health', health))
 app.add_handler(CommandHandler('calls', calls))
@@ -1120,6 +1152,7 @@ app.add_handler(CommandHandler('paper_size', paper_size))
 app.add_handler(CommandHandler('paper_limits', paper_limits))
 app.add_handler(CommandHandler('paper_auto', paper_auto))
 app.add_handler(CommandHandler('paper_stats', paper_stats))
+app.add_handler(CommandHandler('smart', smart))
 app.add_handler(CommandHandler('sweep', sweep))
 app.add_handler(CommandHandler('backup', backup))
 app.add_handler(CommandHandler('pg_dump', pg_dump_backup))

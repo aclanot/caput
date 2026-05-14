@@ -306,9 +306,19 @@ def fmt_liquidation(value, leverage):
     return 'n/a'
 
 
+def token_label(name, symbol, token_id):
+    if symbol and name:
+        return f'{symbol} ({name})'
+    if symbol:
+        return str(symbol)
+    if name:
+        return str(name)
+    return f'Token {token_id}'
+
+
 def signal_message(row):
     (
-        signal_id, token_id, mode, side, confidence_pct,
+        signal_id, token_id, token_name, token_symbol, mode, side, confidence_pct,
         current_price, entry_low, entry_high, take_profit_price, stop_loss_price,
         max_leverage, matched_strategy, historical_trades, historical_winrate,
         historical_avg_pnl, historical_median_pnl, historical_worst_pnl, current_return_pct,
@@ -318,40 +328,21 @@ def signal_message(row):
     ) = row
 
     token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
-    setup_label = 'Drawdown' if side == 'LONG' else 'Reversal from peak'
-
-    title = 'PAPER SIGNAL OPENED' if virtual_position_usdt is not None else 'SIGNAL FOUND (NO PAPER OPEN)'
+    title = 'PAPER CALL OPENED' if virtual_position_usdt is not None else 'CALL FOUND'
+    paper_line = ''
+    if virtual_position_usdt is not None:
+        paper_line = f'Paper: {fmt_money(virtual_position_usdt)} | Balance: {fmt_money(virtual_balance_at_open)}\n'
     return (
-        f'{title}\n\n'
-        f'Token: {token_url}\n'
-        f'Type: {side}\n'
-        f'Mode: {mode}\n'
-        f'Confidence: {confidence_pct}%\n'
-        f'Max leverage: x{max_leverage:g}\n'
-        f'Virtual position: {fmt_money(virtual_position_usdt)}\n'
-        f'Virtual balance: {fmt_money(virtual_balance_at_open)}\n\n'
-        f'Cluster: {cluster_name or "n/a"}\n'
-        f'Cluster risk: {cluster_risk or "n/a"}\n'
-        f'Snapshots: {live_snapshots or 0}\n'
-        f'Max pump: {(max_pump_pct or 0):.2f}%\n'
-        f'{setup_label}: {(setup_move_pct or 0):.2f}%\n\n'
-        f'Current price: {fmt_price(current_price)}\n'
-        f'Entry: {fmt_price(entry_low)} - {fmt_price(entry_high)}\n'
-        f'Take profit: {fmt_price(take_profit_price)}\n'
-        f'Stop loss: {fmt_price(stop_loss_price)}\n'
-        f'Liquidation: {fmt_liquidation(liquidation_price, max_leverage)}\n'
-        f'Reward: {(reward_pct or 0):.2f}%\n'
-        f'Risk to stop: {(risk_pct or 0):.2f}%\n'
-        f'Reward/Risk: {(reward_risk or 0):.2f}\n\n'
-        f'Current return: {current_return_pct:.2f}%\n'
-        f'Strategy: {matched_strategy}\n\n'
-        'Historical stats:\n'
-        f'Trades: {historical_trades}\n'
-        f'Winrate: {historical_winrate * 100:.1f}%\n'
-        f'Avg pnl: {historical_avg_pnl:.2f}%\n'
-        f'Median pnl: {historical_median_pnl:.2f}%\n'
-        f'Worst pnl: {historical_worst_pnl:.2f}%\n\n'
-        f'Signal ID: {signal_id}'
+        f'{title}\n'
+        f'{token_label(token_name, token_symbol, token_id)}\n'
+        f'{side} {mode} | conf {confidence_pct}% | x{max_leverage:g}\n'
+        f'Link: {token_url}\n\n'
+        f'Entry: {fmt_price(current_price)}\n'
+        f'TP: {fmt_price(take_profit_price)}\n'
+        f'SL: {fmt_price(stop_loss_price)}\n'
+        f'Liq: {fmt_liquidation(liquidation_price, max_leverage)}\n'
+        f'{paper_line}'
+        f'ID: {signal_id}'
     )
 
 
@@ -362,7 +353,7 @@ def broadcast_new_signals():
     fill_missing_virtual_open_fields()
     cur.execute('''
     SELECT
-        ls.id, ls.token_id, ls.mode, ls.side, ls.confidence_pct,
+        ls.id, ls.token_id, os.name, os.symbol, ls.mode, ls.side, ls.confidence_pct,
         ls.current_price, ls.entry_low, ls.entry_high, ls.take_profit_price, ls.stop_loss_price,
         ls.max_leverage, ls.matched_strategy, ls.historical_trades, ls.historical_winrate,
         ls.historical_avg_pnl, ls.historical_median_pnl, ls.historical_worst_pnl, ls.current_return_pct,
@@ -371,6 +362,7 @@ def broadcast_new_signals():
         pst.virtual_position_usdt, pst.virtual_balance_at_open
     FROM live_signals ls
     LEFT JOIN paper_signal_trades pst ON pst.signal_id = ls.id
+    LEFT JOIN official_api_token_state os ON os.token_id = ls.token_id
     WHERE COALESCE(ls.sent_to_telegram, false) = false
       AND COALESCE(ls.signal_status, 'OPEN') <> 'CANCELLED'
       AND COALESCE(ls.reason, '') NOT LIKE '%%CANCELLED_QUALITY_GATE%%'
@@ -473,13 +465,14 @@ def update_open_paper_trades():
 def send_closed_trade_results():
     cur.execute('''
     SELECT
-        pst.id, pst.signal_id, pst.token_id, pst.mode, UPPER(pst.side), pst.confidence_pct,
+        pst.id, pst.signal_id, pst.token_id, os.name, os.symbol, pst.mode, UPPER(pst.side), pst.confidence_pct,
         pst.entry_price, pst.close_price, pst.pnl_pct, pst.close_reason, pst.max_leverage,
         pst.opened_at, pst.closed_at, ls.cluster_name, ls.reversal_from_peak_pct,
         pst.liquidation_price, pst.reward_pct, pst.risk_pct, pst.reward_risk,
         pst.virtual_position_usdt, pst.virtual_pnl_usdt, pst.virtual_balance_after_close
     FROM paper_signal_trades pst
     LEFT JOIN live_signals ls ON ls.id = pst.signal_id
+    LEFT JOIN official_api_token_state os ON os.token_id = pst.token_id
     WHERE pst.status = 'CLOSED'
       AND COALESCE(pst.result_sent_to_telegram, false) = false
     ORDER BY pst.closed_at ASC
@@ -489,7 +482,7 @@ def send_closed_trade_results():
     sent = 0
     for row in rows:
         (
-            trade_id, signal_id, token_id, mode, side, confidence_pct,
+            trade_id, signal_id, token_id, token_name, token_symbol, mode, side, confidence_pct,
             entry_price, close_price, pnl_pct, close_reason, max_leverage,
             opened_at, closed_at, cluster_name, setup_move_pct,
             liquidation_price, reward_pct, risk_pct, reward_risk,
@@ -497,33 +490,21 @@ def send_closed_trade_results():
         ) = row
 
         token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
-        setup_label = 'Drawdown' if side == 'LONG' else 'Reversal from peak'
         result_label = {
             'TP': 'TAKE PROFIT',
             'SL': 'STOP LOSS',
             'LIQUIDATION': 'LIQUIDATION',
         }.get(close_reason, close_reason or 'CLOSED')
         text = (
-            f'PAPER TRADE CLOSED: {result_label}\n\n'
-            f'Token: {token_url}\n'
-            f'Signal ID: {signal_id}\n'
-            f'Type: {side}\n'
-            f'Mode: {mode}\n'
-            f'Confidence: {confidence_pct}%\n'
-            f'Cluster: {cluster_name or "n/a"}\n'
-            f'{setup_label}: {(setup_move_pct or 0):.2f}%\n'
-            f'Leverage: x{max_leverage:g}\n\n'
+            f'PAPER CLOSED: {result_label}\n'
+            f'{token_label(token_name, token_symbol, token_id)}\n'
+            f'{side} {mode} | x{max_leverage:g}\n'
+            f'Link: {token_url}\n\n'
             f'Entry: {fmt_price(entry_price)}\n'
             f'Close: {fmt_price(close_price)}\n'
-            f'Liquidation: {fmt_liquidation(liquidation_price, max_leverage)}\n'
-            f'Reward/Risk: {(reward_risk or 0):.2f} '
-            f'({(reward_pct or 0):.2f}% / {(risk_pct or 0):.2f}%)\n'
-            f'Paper PnL: {pnl_pct:.2f}%\n'
-            f'Virtual position: {fmt_money(virtual_position_usdt)}\n'
-            f'Virtual PnL: {fmt_money(virtual_pnl_usdt)}\n'
-            f'Virtual balance: {fmt_money(balance_after)}\n\n'
-            f'Opened: {opened_at}\n'
-            f'Closed: {closed_at}'
+            f'PnL: {pnl_pct:.2f}% ({fmt_money(virtual_pnl_usdt)})\n'
+            f'Balance: {fmt_money(balance_after)}\n'
+            f'ID: {signal_id}'
         )
         try:
             tg_send(text)

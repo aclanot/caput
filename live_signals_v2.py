@@ -34,6 +34,14 @@ MAX_STRATEGIES_PER_TOKEN_SIDE = int(os.getenv('LIVE_SIGNALS_MAX_STRATEGIES_PER_T
 DEBUG_LOG_LIMIT_PER_STATUS = int(os.getenv('LIVE_SIGNALS_DEBUG_LOG_LIMIT_PER_STATUS', '5'))
 SKIP_SCHEMA_ENSURE = os.getenv('LIVE_SIGNALS_SKIP_SCHEMA_ENSURE', 'false').lower() in ('1', 'true', 'yes', 'on')
 OPEN_PAPER_IN_GENERATOR = os.getenv('LIVE_SIGNALS_OPEN_PAPER_IN_GENERATOR', 'false').lower() in ('1', 'true', 'yes', 'on')
+ADAPTIVE_ENABLED = os.getenv('LIVE_SIGNALS_ADAPTIVE_LIVE_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on')
+ADAPTIVE_LOOKBACK_DAYS = int(os.getenv('LIVE_SIGNALS_ADAPTIVE_LOOKBACK_DAYS', '30'))
+ADAPTIVE_MIN_CLOSED_TRADES = int(os.getenv('LIVE_SIGNALS_ADAPTIVE_MIN_CLOSED_TRADES', '5'))
+ADAPTIVE_DISABLE_WINRATE = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_WINRATE', '0.35'))
+ADAPTIVE_DISABLE_AVG_PNL = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_AVG_PNL', '-15'))
+ADAPTIVE_BOOST_WINRATE = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_BOOST_WINRATE', '0.60'))
+ADAPTIVE_BOOST_AVG_PNL = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_BOOST_AVG_PNL', '5'))
+ADAPTIVE_BOOST_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_ADAPTIVE_BOOST_CONFIDENCE', '5'))
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -293,6 +301,56 @@ def flush_debug_examples():
     )
 
 
+def adaptive_performance(mode, side, strategy, exact_strategy=True):
+    strategy_sql = 'AND ls.matched_strategy = %s' if exact_strategy else ''
+    params = [ADAPTIVE_LOOKBACK_DAYS, mode, side]
+    if exact_strategy:
+        params.append(strategy)
+    cur.execute(f'''
+    SELECT
+        COUNT(*) AS closed,
+        COUNT(*) FILTER (WHERE pst.pnl_pct > 0) AS wins,
+        AVG(pst.pnl_pct) AS avg_pnl
+    FROM paper_signal_trades pst
+    JOIN live_signals ls ON ls.id = pst.signal_id
+    WHERE pst.status = 'CLOSED'
+      AND pst.closed_at >= NOW() - (%s || ' days')::interval
+      AND UPPER(ls.mode) = %s
+      AND UPPER(ls.side) = %s
+      {strategy_sql}
+    ''', params)
+    closed, wins, avg_pnl = cur.fetchone()
+    closed = int(closed or 0)
+    wins = int(wins or 0)
+    winrate = wins / closed if closed else None
+    return closed, winrate, avg_pnl
+
+
+def adaptive_gate(mode, side, strategy):
+    if not ADAPTIVE_ENABLED:
+        return False, 0, 'smart=off'
+
+    closed, winrate, avg_pnl = adaptive_performance(mode, side, strategy, exact_strategy=True)
+    scope = 'strategy'
+    if closed < ADAPTIVE_MIN_CLOSED_TRADES:
+        broad_closed, broad_winrate, broad_avg = adaptive_performance(mode, side, strategy, exact_strategy=False)
+        if broad_closed >= ADAPTIVE_MIN_CLOSED_TRADES:
+            closed, winrate, avg_pnl = broad_closed, broad_winrate, broad_avg
+            scope = 'mode'
+
+    if closed < ADAPTIVE_MIN_CLOSED_TRADES:
+        return False, 0, f'smart learning n={closed}/{ADAPTIVE_MIN_CLOSED_TRADES}'
+
+    avg = float(avg_pnl or 0)
+    if winrate is not None and (winrate < ADAPTIVE_DISABLE_WINRATE or avg < ADAPTIVE_DISABLE_AVG_PNL):
+        return True, 0, f'smart blocked {scope} n={closed} win={winrate*100:.1f}% avg={avg:.2f}%'
+
+    if winrate is not None and winrate >= ADAPTIVE_BOOST_WINRATE and avg >= ADAPTIVE_BOOST_AVG_PNL:
+        return False, ADAPTIVE_BOOST_CONFIDENCE, f'smart boost {scope} n={closed} win={winrate*100:.1f}% avg={avg:.2f}%'
+
+    return False, 0, f'smart ok {scope} n={closed} win={(winrate or 0)*100:.1f}% avg={avg:.2f}%'
+
+
 if not SKIP_SCHEMA_ENSURE:
     ensure_schema()
 cur.execute('DELETE FROM live_signals WHERE created_at < NOW() - interval \'1 day\'')
@@ -485,6 +543,13 @@ for row in rows:
         continue
 
     conf = confidence(winrate, avg_pnl, med_pnl, worst_pnl, trades, mode, side, cluster_risk, setup_move)
+    adaptive_blocked, adaptive_adjustment, adaptive_reason = adaptive_gate(mode, side, strategy)
+    if adaptive_blocked:
+        skip('smart_blocked', adaptive_reason)
+        continue
+    if adaptive_adjustment:
+        conf = int(round(clamp(conf + adaptive_adjustment, 1, 99)))
+
     min_confidence = LONG_MIN_CONFIDENCE if side == 'LONG' else MIN_CONFIDENCE
     if conf < min_confidence:
         skip('low_confidence')
@@ -517,6 +582,7 @@ for row in rows:
         f'current={current_return:.2f}% max_pump={max_pump:.2f}% max_dd={fmt_pct(max_dd)} '
         f'setup_move={setup_move:.2f}% bounce_from_low={bounce_note:.2f}% '
         f'reward={reward_pct:.2f}% risk={risk_pct:.2f}% rr={reward_risk:.2f} '
+        f'{adaptive_reason} '
         f'snapshots={snapshots} historical_winrate={winrate*100:.1f}% avg={avg_pnl:.2f}% trades={trades}'
     )
 
@@ -529,7 +595,7 @@ for row in rows:
         historical_worst_pnl, reason, created_at, signal_status,
         live_snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk,
         adaptive_adjustment, adaptive_reason, liquidation_price, reward_pct, risk_pct, reward_risk
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,0,'v2_no_adaptive_yet',%s,%s,%s,%s)
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     ''', (
         token_id, mode, side, f'{side}_SIGNAL', label, conf,
@@ -537,6 +603,7 @@ for row in rows:
         current_return, strategy,
         trades, winrate, avg_pnl, med_pnl, worst_pnl, reason, utcnow(),
         snapshots, max_pump, setup_move, cluster_name, cluster_risk,
+        adaptive_adjustment, adaptive_reason,
         liquidation_price, reward_pct, risk_pct, reward_risk,
     ))
     signal_id = cur.fetchone()[0]
