@@ -4,9 +4,13 @@ import subprocess
 import sys
 import time
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
-load_dotenv()
+if load_dotenv:
+    load_dotenv()
 
 RESTART_INITIAL_SECONDS = float(os.getenv('WORKER_RESTART_INITIAL_SECONDS', '5'))
 RESTART_MAX_SECONDS = float(os.getenv('WORKER_RESTART_MAX_SECONDS', '60'))
