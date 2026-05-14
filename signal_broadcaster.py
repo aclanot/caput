@@ -113,6 +113,7 @@ def ensure_schema():
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_pct DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS capital_reserved BOOLEAN DEFAULT FALSE',
     ])
 
     cur.execute('''
@@ -145,6 +146,7 @@ def ensure_schema():
         ('max_open_trades', str(PAPER_MAX_OPEN_TRADES), utcnow()),
         ('max_position_pct', str(PAPER_MAX_POSITION_PCT), utcnow()),
     ])
+    reserve_existing_open_positions()
 
 
 def paper_setting(key, default):
@@ -179,13 +181,39 @@ def max_open_trades():
     return max(0, paper_setting_int('max_open_trades', PAPER_MAX_OPEN_TRADES))
 
 
+def reserved_capital():
+    cur.execute('''
+    SELECT COALESCE(SUM(virtual_position_usdt), 0)
+    FROM paper_signal_trades
+    WHERE status = 'OPEN'
+      AND COALESCE(capital_reserved, false) = true
+    ''')
+    return float(cur.fetchone()[0] or 0)
+
+
 def effective_trade_size(balance=None):
-    balance = account_balance() if balance is None else float(balance)
+    free_balance = account_balance() if balance is None else float(balance)
+    equity_for_sizing = free_balance + reserved_capital()
     size = configured_trade_size()
     max_pct = paper_setting_float('max_position_pct', PAPER_MAX_POSITION_PCT)
     if max_pct > 0:
-        size = min(size, max(0.0, balance * max_pct / 100.0))
+        size = min(size, max(0.0, equity_for_sizing * max_pct / 100.0))
+    size = min(size, free_balance)
     return max(0.0, size)
+
+
+def paper_pnl_pct(side, entry_price, current_price, leverage, close_reason=None):
+    if not entry_price or entry_price <= 0 or current_price is None:
+        return None
+    side = str(side or '').upper()
+    leverage = leverage or 1.0
+    if close_reason == 'LIQUIDATION':
+        return -100.0
+    if side == 'SHORT':
+        raw_pct = (1.0 - current_price / entry_price) * 100.0
+    else:
+        raw_pct = (current_price / entry_price - 1.0) * 100.0
+    return max(-100.0, raw_pct * leverage)
 
 
 def account_balance():
@@ -199,6 +227,40 @@ def account_balance():
     RETURNING balance_usdt
     ''', (PAPER_START_BALANCE_USDT, utcnow()))
     return float(cur.fetchone()[0])
+
+
+def reserve_existing_open_positions():
+    cur.execute('''
+    SELECT id, COALESCE(virtual_position_usdt, %s) AS position_usdt
+    FROM paper_signal_trades
+    WHERE status = 'OPEN'
+      AND COALESCE(capital_reserved, false) = false
+    ORDER BY id ASC
+    ''', (PAPER_TRADE_SIZE_USDT,))
+    rows = cur.fetchall()
+    if not rows:
+        return 0
+
+    reserved = 0
+    for trade_id, position_usdt in rows:
+        position_usdt = float(position_usdt or 0)
+        if position_usdt <= 0:
+            continue
+        balance = account_balance()
+        if balance < position_usdt:
+            break
+        balance_after = update_account_balance(-position_usdt)
+        cur.execute('''
+        UPDATE paper_signal_trades
+        SET capital_reserved = true,
+            virtual_position_usdt = %s,
+            virtual_balance_at_open = %s
+        WHERE id = %s
+        ''', (position_usdt, balance_after, trade_id))
+        reserved += 1
+    if reserved:
+        print(f'reserved existing paper trades: {reserved}', flush=True)
+    return reserved
 
 
 def fill_missing_virtual_open_fields():
@@ -234,23 +296,11 @@ def open_missing_paper_trades():
     if slots <= 0:
         return 0
 
-    balance = account_balance()
-    position_size = effective_trade_size(balance)
-    if position_size <= 0:
-        return 0
-
     cur.execute('''
-    INSERT INTO paper_signal_trades(
-        signal_id, token_id, mode, side, status, confidence_pct,
-        entry_price, take_profit_price, stop_loss_price, max_leverage, opened_at,
-        liquidation_price, reward_pct, risk_pct, reward_risk,
-        virtual_position_usdt, virtual_balance_at_open
-    )
     SELECT
-        ls.id, ls.token_id, ls.mode, ls.side, 'OPEN', ls.confidence_pct,
-        ls.current_price, ls.take_profit_price, ls.stop_loss_price, ls.max_leverage, %s,
-        ls.liquidation_price, ls.reward_pct, ls.risk_pct, ls.reward_risk,
-        %s, %s
+        ls.id, ls.token_id, ls.mode, ls.side, ls.confidence_pct,
+        ls.current_price, ls.take_profit_price, ls.stop_loss_price, ls.max_leverage,
+        ls.liquidation_price, ls.reward_pct, ls.risk_pct, ls.reward_risk
     FROM live_signals ls
     LEFT JOIN paper_signal_trades pst ON pst.signal_id = ls.id
     WHERE pst.id IS NULL
@@ -262,9 +312,41 @@ def open_missing_paper_trades():
              ls.created_at ASC,
              ls.id ASC
     LIMIT %s
-    ON CONFLICT(signal_id) DO NOTHING
-    ''', (utcnow(), position_size, balance, MAX_SIGNAL_AGE_MINUTES, slots))
-    return cur.rowcount or 0
+    ''', (MAX_SIGNAL_AGE_MINUTES, slots))
+    rows = cur.fetchall()
+
+    opened = 0
+    for row in rows:
+        (
+            signal_id, token_id, mode, side, confidence_pct,
+            entry_price, tp, sl, max_leverage,
+            liquidation_price, reward_pct, risk_pct, reward_risk,
+        ) = row
+        balance = account_balance()
+        position_size = effective_trade_size(balance)
+        if position_size <= 0 or balance < position_size:
+            break
+        balance_after = update_account_balance(-position_size)
+        cur.execute('''
+        INSERT INTO paper_signal_trades(
+            signal_id, token_id, mode, side, status, confidence_pct,
+            entry_price, take_profit_price, stop_loss_price, max_leverage, opened_at,
+            liquidation_price, reward_pct, risk_pct, reward_risk,
+            virtual_position_usdt, virtual_balance_at_open, capital_reserved
+        ) VALUES (%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true)
+        ON CONFLICT(signal_id) DO NOTHING
+        RETURNING id
+        ''', (
+            signal_id, token_id, mode, side, confidence_pct,
+            entry_price, tp, sl, max_leverage, utcnow(),
+            liquidation_price, reward_pct, risk_pct, reward_risk,
+            position_size, balance_after,
+        ))
+        if cur.fetchone():
+            opened += 1
+        else:
+            update_account_balance(position_size)
+    return opened
 
 
 def tg_send(text):
@@ -328,20 +410,19 @@ def signal_message(row):
     ) = row
 
     token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
-    title = 'PAPER CALL OPENED' if virtual_position_usdt is not None else 'CALL FOUND'
+    title = 'PAPER CALL' if virtual_position_usdt is not None else 'CALL'
     paper_line = ''
     if virtual_position_usdt is not None:
-        paper_line = f'Paper: {fmt_money(virtual_position_usdt)} | Balance: {fmt_money(virtual_balance_at_open)}\n'
+        paper_line = f'Paper: {fmt_money(virtual_position_usdt)} | Free: {fmt_money(virtual_balance_at_open)}\n'
     return (
         f'{title}\n'
         f'{token_label(token_name, token_symbol, token_id)}\n'
-        f'{side} {mode} | conf {confidence_pct}% | x{max_leverage:g}\n'
-        f'Link: {token_url}\n\n'
+        f'{side} {mode}\n'
         f'Entry: {fmt_price(current_price)}\n'
         f'TP: {fmt_price(take_profit_price)}\n'
         f'SL: {fmt_price(stop_loss_price)}\n'
-        f'Liq: {fmt_liquidation(liquidation_price, max_leverage)}\n'
         f'{paper_line}'
+        f'Link: {token_url}\n'
         f'ID: {signal_id}'
     )
 
@@ -397,7 +478,8 @@ def update_open_paper_trades():
     SELECT
         pst.id, pst.signal_id, pst.token_id, UPPER(pst.side),
         pst.entry_price, pst.take_profit_price, pst.stop_loss_price,
-        pst.max_leverage, pst.virtual_position_usdt, pst.liquidation_price, ltf.current_price
+        pst.max_leverage, pst.virtual_position_usdt, pst.liquidation_price,
+        COALESCE(pst.capital_reserved, false), ltf.current_price
     FROM paper_signal_trades pst
     LEFT JOIN live_token_features ltf ON ltf.token_id = pst.token_id
     WHERE pst.status = 'OPEN'
@@ -408,7 +490,7 @@ def update_open_paper_trades():
     rows = cur.fetchall()
     closed = 0
     for row in rows:
-        trade_id, signal_id, token_id, side, entry_price, tp, sl, max_leverage, position_usdt, liquidation_price, current_price = row
+        trade_id, signal_id, token_id, side, entry_price, tp, sl, max_leverage, position_usdt, liquidation_price, capital_reserved, current_price = row
         if current_price is None or entry_price is None or entry_price <= 0:
             continue
 
@@ -420,7 +502,6 @@ def update_open_paper_trades():
                 close_reason = 'TP'
             elif sl is not None and current_price >= sl:
                 close_reason = 'SL'
-            pnl_pct = (entry_price / current_price - 1.0) * 100.0
         else:
             if liquidation_price is not None and current_price <= liquidation_price:
                 close_reason = 'LIQUIDATION'
@@ -428,15 +509,17 @@ def update_open_paper_trades():
                 close_reason = 'TP'
             elif sl is not None and current_price <= sl:
                 close_reason = 'SL'
-            pnl_pct = (current_price / entry_price - 1.0) * 100.0
 
         if not close_reason:
             continue
 
-        leveraged_pnl_pct = pnl_pct * (max_leverage or 1.0)
+        leveraged_pnl_pct = paper_pnl_pct(side, entry_price, current_price, max_leverage, close_reason)
+        if leveraged_pnl_pct is None:
+            continue
         position_usdt = float(position_usdt or effective_trade_size())
         virtual_pnl_usdt = position_usdt * leveraged_pnl_pct / 100.0
-        balance_after = update_account_balance(virtual_pnl_usdt)
+        balance_delta = virtual_pnl_usdt + (position_usdt if capital_reserved else 0.0)
+        balance_after = update_account_balance(balance_delta)
 
         cur.execute('''
         UPDATE paper_signal_trades
@@ -447,7 +530,8 @@ def update_open_paper_trades():
             close_reason = %s,
             virtual_position_usdt = %s,
             virtual_pnl_usdt = %s,
-            virtual_balance_after_close = %s
+            virtual_balance_after_close = %s,
+            capital_reserved = false
         WHERE id = %s
         ''', (
             utcnow(), current_price, leveraged_pnl_pct, close_reason,
@@ -503,7 +587,7 @@ def send_closed_trade_results():
             f'Entry: {fmt_price(entry_price)}\n'
             f'Close: {fmt_price(close_price)}\n'
             f'PnL: {pnl_pct:.2f}% ({fmt_money(virtual_pnl_usdt)})\n'
-            f'Balance: {fmt_money(balance_after)}\n'
+            f'Free: {fmt_money(balance_after)}\n'
             f'ID: {signal_id}'
         )
         try:

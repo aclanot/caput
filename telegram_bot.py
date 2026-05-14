@@ -144,8 +144,10 @@ def ensure_paper_schema(cur):
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_pct DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS capital_reserved BOOLEAN DEFAULT FALSE',
     ]:
         cur.execute(ddl)
+    reserve_existing_open_positions(cur)
 
 
 def paper_setting(cur, key, default):
@@ -162,6 +164,120 @@ def set_paper_setting(cur, key, value):
         setting_value = EXCLUDED.setting_value,
         updated_at = EXCLUDED.updated_at
     ''', (key, str(value), utcnow()))
+
+
+def paper_pnl_pct(side, entry_price, current_price, leverage, close_reason=None):
+    if not entry_price or entry_price <= 0 or current_price is None:
+        return None
+    side = str(side or '').upper()
+    leverage = leverage or 1.0
+    if close_reason == 'LIQUIDATION':
+        return -100.0
+    if side == 'SHORT':
+        raw_pct = (1.0 - current_price / entry_price) * 100.0
+    else:
+        raw_pct = (current_price / entry_price - 1.0) * 100.0
+    return max(-100.0, raw_pct * leverage)
+
+
+def account_balance(cur):
+    cur.execute("SELECT balance_usdt FROM paper_account WHERE account_key = 'default'")
+    row = cur.fetchone()
+    if row:
+        return float(row[0] or 0)
+    cur.execute('''
+    INSERT INTO paper_account(account_key, balance_usdt, updated_at)
+    VALUES ('default', %s, %s)
+    RETURNING balance_usdt
+    ''', (PAPER_START_BALANCE_USDT, utcnow()))
+    return float(cur.fetchone()[0])
+
+
+def update_account_balance(cur, delta_usdt):
+    balance = account_balance(cur)
+    new_balance = balance + float(delta_usdt)
+    cur.execute('''
+    UPDATE paper_account
+    SET balance_usdt = %s, updated_at = %s
+    WHERE account_key = 'default'
+    ''', (new_balance, utcnow()))
+    return new_balance
+
+
+def reserve_existing_open_positions(cur):
+    if not table_exists(cur, 'paper_signal_trades') or not table_exists(cur, 'paper_account'):
+        return 0
+    cur.execute('''
+    SELECT id, COALESCE(virtual_position_usdt, %s) AS position_usdt
+    FROM paper_signal_trades
+    WHERE status = 'OPEN'
+      AND COALESCE(capital_reserved, false) = false
+    ORDER BY id ASC
+    ''', (PAPER_TRADE_SIZE_USDT,))
+    rows = cur.fetchall()
+    reserved = 0
+    for trade_id, position_usdt in rows:
+        position_usdt = float(position_usdt or 0)
+        if position_usdt <= 0:
+            continue
+        balance = account_balance(cur)
+        if balance < position_usdt:
+            break
+        balance_after = update_account_balance(cur, -position_usdt)
+        cur.execute('''
+        UPDATE paper_signal_trades
+        SET capital_reserved = true,
+            virtual_position_usdt = %s,
+            virtual_balance_at_open = %s
+        WHERE id = %s
+        ''', (position_usdt, balance_after, trade_id))
+        reserved += 1
+    return reserved
+
+
+def paper_account_snapshot(cur):
+    ensure_paper_schema(cur)
+    balance = account_balance(cur)
+    cur.execute('''
+    SELECT
+        pst.id, UPPER(pst.side), pst.entry_price, ltf.current_price,
+        pst.max_leverage, pst.virtual_position_usdt,
+        pst.liquidation_price, COALESCE(pst.capital_reserved, false)
+    FROM paper_signal_trades pst
+    LEFT JOIN live_token_features ltf ON ltf.token_id = pst.token_id
+    WHERE pst.status = 'OPEN'
+    ''')
+    open_rows = cur.fetchall()
+    reserved = 0.0
+    unreserved = 0.0
+    unrealized = 0.0
+    priced = 0
+    for _, side, entry_price, current_price, leverage, position_usdt, liquidation_price, capital_reserved in open_rows:
+        position_usdt = float(position_usdt or 0)
+        if capital_reserved:
+            reserved += position_usdt
+        else:
+            unreserved += position_usdt
+        close_reason = None
+        if liquidation_price is not None and current_price is not None:
+            if side == 'SHORT' and current_price >= liquidation_price:
+                close_reason = 'LIQUIDATION'
+            elif side == 'LONG' and current_price <= liquidation_price:
+                close_reason = 'LIQUIDATION'
+        pnl_pct = paper_pnl_pct(side, entry_price, current_price, leverage, close_reason)
+        if pnl_pct is not None:
+            unrealized += position_usdt * pnl_pct / 100.0
+            priced += 1
+    equity = balance + reserved + unreserved + unrealized
+    return {
+        'free': balance,
+        'reserved': reserved,
+        'unreserved': unreserved,
+        'unrealized': unrealized,
+        'equity': equity,
+        'open_count': len(open_rows),
+        'priced_open_count': priced,
+    }
 
 
 def paper_bool(cur, key, default):
@@ -310,14 +426,11 @@ async def reply_text(update, text):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         'Caput bot\n\n'
-        '/calls - recent calls\n'
+        '/stats - balance, winrate, PnL\n'
         '/paper - open and latest paper trades\n'
-        '/stats or /paper_stats - winrate and PnL\n'
-        '/paper_account - virtual balance/settings\n'
-        '/paper_balance 1000 - set virtual balance\n'
-        '/paper_size 100 - set paper trade size\n'
-        '/paper_limits 10 10 - max open trades and max % balance\n'
-        '/paper_auto on|off - auto paper opens\n'
+        '/calls - recent calls\n'
+        '/balance add 100 | remove 50 | set 1000\n'
+        '/auto on|off - auto paper opens\n'
         '/smart - adaptive learning status\n'
         '/health - pipeline status'
     )
@@ -753,30 +866,27 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def paper_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     ensure_paper_schema(cur)
-    cur.execute("SELECT balance_usdt, updated_at FROM paper_account WHERE account_key = 'default'")
-    balance, updated_at = cur.fetchone()
+    snapshot = paper_account_snapshot(cur)
     auto_open = paper_bool(cur, 'auto_open', PAPER_AUTO_OPEN)
     trade_size = float(paper_setting(cur, 'trade_size_usdt', str(PAPER_TRADE_SIZE_USDT)))
     max_open = int(float(paper_setting(cur, 'max_open_trades', str(PAPER_MAX_OPEN_TRADES))))
     max_position_pct = float(paper_setting(cur, 'max_position_pct', str(PAPER_MAX_POSITION_PCT)))
-    effective_size = min(trade_size, float(balance or 0) * max_position_pct / 100.0) if max_position_pct > 0 else trade_size
-
-    cur.execute('''
-    SELECT
-        COUNT(*) FILTER (WHERE status = 'OPEN') AS open_count,
-        COALESCE(SUM(virtual_position_usdt) FILTER (WHERE status = 'OPEN'), 0) AS open_exposure,
-        COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_count,
-        COALESCE(SUM(virtual_pnl_usdt) FILTER (WHERE status = 'CLOSED'), 0) AS closed_pnl
-    FROM paper_signal_trades
-    ''')
-    open_count, open_exposure, closed_count, closed_pnl = cur.fetchone()
+    effective_size = trade_size
+    if max_position_pct > 0:
+        effective_size = min(effective_size, snapshot['equity'] * max_position_pct / 100.0)
+    effective_size = min(effective_size, snapshot['free'])
+    cur.execute("SELECT COUNT(*), COALESCE(SUM(virtual_pnl_usdt), 0) FROM paper_signal_trades WHERE status = 'CLOSED'")
+    closed_count, closed_pnl = cur.fetchone()
 
     text = (
         'Paper account\n\n'
         f'Auto: {"ON" if auto_open else "OFF"}\n'
-        f'Balance: {fmt_money(balance)}\n'
+        f'Free: {fmt_money(snapshot["free"])}\n'
+        f'Reserved: {fmt_money(snapshot["reserved"])}\n'
+        f'Unrealized: {fmt_money(snapshot["unrealized"])}\n'
+        f'Equity: {fmt_money(snapshot["equity"])}\n'
         f'Next size: {fmt_money(effective_size)}\n'
-        f'Open: {open_count or 0}/{max_open} | Exposure: {fmt_money(open_exposure)}\n'
+        f'Open: {snapshot["open_count"] or 0}/{max_open}\n'
         f'Closed: {closed_count or 0} | PnL: {fmt_money(closed_pnl)}'
     )
     await update.message.reply_text(text)
@@ -785,21 +895,58 @@ async def paper_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def paper_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     ensure_paper_schema(cur)
-    amount = parse_float_arg(context)
-    if amount is None:
+    if not context.args:
         await paper_account(update, context)
         return
-    if amount < 0:
-        await update.message.reply_text('Balance must be >= 0.')
+
+    action = context.args[0].lower()
+    if action in ('add', 'remove', 'set'):
+        amount = None
+        for arg in context.args[1:]:
+            try:
+                amount = float(arg.replace('$', '').replace(',', ''))
+                break
+            except ValueError:
+                continue
+    else:
+        action = 'set'
+        amount = parse_float_arg(context)
+
+    if amount is None:
+        await update.message.reply_text('Use /balance add 100, /balance remove 50, or /balance set 1000.')
         return
-    cur.execute('''
-    INSERT INTO paper_account(account_key, balance_usdt, updated_at)
-    VALUES ('default', %s, %s)
-    ON CONFLICT(account_key) DO UPDATE SET
-        balance_usdt = EXCLUDED.balance_usdt,
-        updated_at = EXCLUDED.updated_at
-    ''', (amount, utcnow()))
-    await update.message.reply_text(f'Paper virtual balance set to {fmt_money(amount)}.')
+    if amount < 0:
+        await update.message.reply_text('Amount must be >= 0.')
+        return
+
+    current = account_balance(cur)
+    if action == 'add':
+        new_balance = update_account_balance(cur, amount)
+        verb = 'added'
+    elif action == 'remove':
+        if amount > current:
+            await update.message.reply_text(f'Not enough free balance. Free: {fmt_money(current)}')
+            return
+        new_balance = update_account_balance(cur, -amount)
+        verb = 'removed'
+    else:
+        new_balance = amount
+        verb = 'set'
+        cur.execute('''
+        INSERT INTO paper_account(account_key, balance_usdt, updated_at)
+        VALUES ('default', %s, %s)
+        ON CONFLICT(account_key) DO UPDATE SET
+            balance_usdt = EXCLUDED.balance_usdt,
+            updated_at = EXCLUDED.updated_at
+        ''', (new_balance, utcnow()))
+
+    snapshot = paper_account_snapshot(cur)
+    await update.message.reply_text(
+        f'Balance {verb}: {fmt_money(amount)}\n'
+        f'Free: {fmt_money(snapshot["free"])}\n'
+        f'Reserved: {fmt_money(snapshot["reserved"])}\n'
+        f'Equity: {fmt_money(snapshot["equity"])}'
+    )
 
 
 async def paper_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -822,11 +969,11 @@ async def paper_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_paper_schema(cur)
     if not context.args:
         auto_open = paper_bool(cur, 'auto_open', PAPER_AUTO_OPEN)
-        await update.message.reply_text(f'Paper auto open is {"ON" if auto_open else "OFF"}. Use /paper_auto on or /paper_auto off.')
+        await update.message.reply_text(f'Paper auto open is {"ON" if auto_open else "OFF"}. Use /auto on or /auto off.')
         return
     value = context.args[0].lower()
     if value not in ('on', 'off', 'true', 'false', '1', '0', 'yes', 'no'):
-        await update.message.reply_text('Use /paper_auto on or /paper_auto off.')
+        await update.message.reply_text('Use /auto on or /auto off.')
         return
     enabled = value in ('on', 'true', '1', 'yes')
     set_paper_setting(cur, 'auto_open', 'true' if enabled else 'false')
@@ -892,22 +1039,21 @@ async def paper_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
       AND closed_at >= NOW() - (%s || ' days')::interval
     ''', (days,))
     closed, wins, losses, flat, avg_pnl, median_pnl, worst_pnl, best_pnl, virtual_pnl = cur.fetchone()
-    winrate = (wins / closed * 100.0) if closed else 0
-    cur.execute("SELECT balance_usdt FROM paper_account WHERE account_key = 'default'")
-    balance_row = cur.fetchone()
-    balance = balance_row[0] if balance_row else None
-    cur.execute("SELECT COUNT(*) FROM paper_signal_trades WHERE status = 'OPEN'")
-    open_count = cur.fetchone()[0]
+    winrate_text = f'{(wins / closed * 100.0):.1f}% ({wins or 0}W / {losses or 0}L)' if closed else 'n/a (no closed trades yet)'
+    snapshot = paper_account_snapshot(cur)
 
     lines = [
         f'Paper stats {days}d',
         '',
-        f'Balance: {fmt_money(balance)}',
-        f'Open trades: {open_count or 0}',
+        f'Free: {fmt_money(snapshot["free"])}',
+        f'Reserved: {fmt_money(snapshot["reserved"])}',
+        f'Unrealized: {fmt_money(snapshot["unrealized"])}',
+        f'Equity: {fmt_money(snapshot["equity"])}',
+        f'Open trades: {snapshot["open_count"] or 0}',
         f'Closed: {closed or 0}',
-        f'Winrate: {winrate:.1f}% ({wins or 0}W / {losses or 0}L)',
+        f'Winrate: {winrate_text}',
         f'Avg: {fmt_pct(avg_pnl)} | Best: {fmt_pct(best_pnl)} | Worst: {fmt_pct(worst_pnl)}',
-        f'Virtual PnL: {fmt_money(virtual_pnl)}',
+        f'Realized PnL: {fmt_money(virtual_pnl)}',
     ]
 
     cur.execute('''
@@ -1148,9 +1294,11 @@ app.add_handler(CommandHandler('short', short_calls))
 app.add_handler(CommandHandler('paper', paper))
 app.add_handler(CommandHandler('paper_account', paper_account))
 app.add_handler(CommandHandler('paper_balance', paper_balance))
+app.add_handler(CommandHandler('balance', paper_balance))
 app.add_handler(CommandHandler('paper_size', paper_size))
 app.add_handler(CommandHandler('paper_limits', paper_limits))
 app.add_handler(CommandHandler('paper_auto', paper_auto))
+app.add_handler(CommandHandler('auto', paper_auto))
 app.add_handler(CommandHandler('paper_stats', paper_stats))
 app.add_handler(CommandHandler('smart', smart))
 app.add_handler(CommandHandler('sweep', sweep))
