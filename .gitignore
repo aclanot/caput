@@ -27,6 +27,7 @@ backup/
 *.zip
 *.dump
 *.log
+*.pid
 
 .DS_Store
 Thumbs.db
