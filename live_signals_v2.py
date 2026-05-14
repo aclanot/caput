@@ -37,11 +37,17 @@ OPEN_PAPER_IN_GENERATOR = os.getenv('LIVE_SIGNALS_OPEN_PAPER_IN_GENERATOR', 'fal
 ADAPTIVE_ENABLED = os.getenv('LIVE_SIGNALS_ADAPTIVE_LIVE_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on')
 ADAPTIVE_LOOKBACK_DAYS = int(os.getenv('LIVE_SIGNALS_ADAPTIVE_LOOKBACK_DAYS', '30'))
 ADAPTIVE_MIN_CLOSED_TRADES = int(os.getenv('LIVE_SIGNALS_ADAPTIVE_MIN_CLOSED_TRADES', '5'))
-ADAPTIVE_DISABLE_WINRATE = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_WINRATE', '0.35'))
-ADAPTIVE_DISABLE_AVG_PNL = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_AVG_PNL', '-15'))
+ADAPTIVE_DISABLE_WINRATE = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_WINRATE', '0.55'))
+ADAPTIVE_DISABLE_AVG_PNL = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_DISABLE_AVG_PNL', '1'))
 ADAPTIVE_BOOST_WINRATE = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_BOOST_WINRATE', '0.60'))
 ADAPTIVE_BOOST_AVG_PNL = float(os.getenv('LIVE_SIGNALS_ADAPTIVE_BOOST_AVG_PNL', '5'))
 ADAPTIVE_BOOST_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_ADAPTIVE_BOOST_CONFIDENCE', '5'))
+ADAPTIVE_ALLOW_UNLEARNED = os.getenv('LIVE_SIGNALS_ADAPTIVE_ALLOW_UNLEARNED', 'false').lower() in ('1', 'true', 'yes', 'on')
+BUY_BUCKET_MIN_CLOSED = int(os.getenv('LIVE_SIGNALS_BUY_BUCKET_MIN_CLOSED', '8'))
+BUY_BUCKET_SIZE = float(os.getenv('LIVE_SIGNALS_BUY_BUCKET_SIZE', '1'))
+SHORT_MIN_SELLS = int(os.getenv('LIVE_SIGNALS_SHORT_MIN_SELLS', '1'))
+SHORT_MAX_UNLEARNED_BUY_SELL_RATIO = float(os.getenv('LIVE_SIGNALS_SHORT_MAX_UNLEARNED_BUY_SELL_RATIO', '4'))
+MAX_NEW_SIGNALS_PER_CYCLE = int(os.getenv('LIVE_SIGNALS_MAX_NEW_SIGNALS_PER_CYCLE', '2'))
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -106,6 +112,10 @@ def ensure_schema():
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reward_pct DOUBLE PRECISION',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
         'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS buy_sell_ratio DOUBLE PRECISION',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS buys INT',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS sells INT',
+        'ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS traders INT',
     ])
 
     cur.execute('''
@@ -330,29 +340,86 @@ def adaptive_performance(mode, side, strategy, exact_strategy=True):
     return closed, winrate, avg_pnl
 
 
+def performance_blocks(closed, winrate, avg_pnl):
+    avg = float(avg_pnl or 0)
+    return winrate is not None and (winrate < ADAPTIVE_DISABLE_WINRATE or avg < ADAPTIVE_DISABLE_AVG_PNL)
+
+
 def adaptive_gate(mode, side, strategy):
     if not ADAPTIVE_ENABLED:
         return False, 0, 'smart=off'
 
     closed, winrate, avg_pnl = adaptive_performance(mode, side, strategy, exact_strategy=True)
-    scope = 'strategy'
-    if closed < ADAPTIVE_MIN_CLOSED_TRADES:
-        broad_closed, broad_winrate, broad_avg = adaptive_performance(mode, side, strategy, exact_strategy=False)
-        if broad_closed >= ADAPTIVE_MIN_CLOSED_TRADES:
-            closed, winrate, avg_pnl = broad_closed, broad_winrate, broad_avg
-            scope = 'mode'
+    if closed >= ADAPTIVE_MIN_CLOSED_TRADES:
+        avg = float(avg_pnl or 0)
+        if performance_blocks(closed, winrate, avg_pnl):
+            return True, 0, f'smart blocked strategy n={closed} win={winrate*100:.1f}% avg={avg:.2f}%'
+        if winrate is not None and winrate >= ADAPTIVE_BOOST_WINRATE and avg >= ADAPTIVE_BOOST_AVG_PNL:
+            return False, ADAPTIVE_BOOST_CONFIDENCE, f'smart boost strategy n={closed} win={winrate*100:.1f}% avg={avg:.2f}%'
+        return False, 0, f'smart ok strategy n={closed} win={(winrate or 0)*100:.1f}% avg={avg:.2f}%'
 
-    if closed < ADAPTIVE_MIN_CLOSED_TRADES:
-        return False, 0, f'smart learning n={closed}/{ADAPTIVE_MIN_CLOSED_TRADES}'
+    broad_closed, broad_winrate, broad_avg = adaptive_performance(mode, side, strategy, exact_strategy=False)
+    if broad_closed >= ADAPTIVE_MIN_CLOSED_TRADES:
+        avg = float(broad_avg or 0)
+        if performance_blocks(broad_closed, broad_winrate, broad_avg):
+            return True, 0, f'smart blocked mode n={broad_closed} win={broad_winrate*100:.1f}% avg={avg:.2f}%'
+        return False, 0, f'smart explore strategy n={closed}/{ADAPTIVE_MIN_CLOSED_TRADES}; mode ok n={broad_closed} win={(broad_winrate or 0)*100:.1f}% avg={avg:.2f}%'
 
-    avg = float(avg_pnl or 0)
-    if winrate is not None and (winrate < ADAPTIVE_DISABLE_WINRATE or avg < ADAPTIVE_DISABLE_AVG_PNL):
-        return True, 0, f'smart blocked {scope} n={closed} win={winrate*100:.1f}% avg={avg:.2f}%'
+    if not ADAPTIVE_ALLOW_UNLEARNED:
+        return True, 0, f'smart blocked unlearned n={closed}/{ADAPTIVE_MIN_CLOSED_TRADES}'
 
-    if winrate is not None and winrate >= ADAPTIVE_BOOST_WINRATE and avg >= ADAPTIVE_BOOST_AVG_PNL:
-        return False, ADAPTIVE_BOOST_CONFIDENCE, f'smart boost {scope} n={closed} win={winrate*100:.1f}% avg={avg:.2f}%'
+    return False, 0, f'smart learning n={closed}/{ADAPTIVE_MIN_CLOSED_TRADES}'
 
-    return False, 0, f'smart ok {scope} n={closed} win={(winrate or 0)*100:.1f}% avg={avg:.2f}%'
+
+def buy_pressure_bucket(value):
+    if value is None or BUY_BUCKET_SIZE <= 0:
+        return None
+    value = max(0.0, float(value))
+    return int(value / BUY_BUCKET_SIZE) * BUY_BUCKET_SIZE
+
+
+def buy_pressure_gate(side, buy_sell_ratio, buys, sells, traders):
+    side = str(side or '').upper()
+    if side != 'SHORT':
+        return False, 'buy learning only for shorts'
+    sells = int(sells or 0)
+    buys = int(buys or 0)
+    traders = int(traders or 0)
+    if sells < SHORT_MIN_SELLS:
+        return True, f'buy pressure blocked sells={sells} min={SHORT_MIN_SELLS}'
+
+    bucket = buy_pressure_bucket(buy_sell_ratio)
+    if bucket is None:
+        return False, 'buy pressure n/a'
+
+    low = bucket
+    high = bucket + BUY_BUCKET_SIZE
+    cur.execute('''
+    SELECT
+        COUNT(*) AS closed,
+        COUNT(*) FILTER (WHERE pst.pnl_pct > 0) AS wins,
+        AVG(pst.pnl_pct) AS avg_pnl
+    FROM paper_signal_trades pst
+    JOIN live_signals ls ON ls.id = pst.signal_id
+    WHERE pst.status = 'CLOSED'
+      AND pst.closed_at >= NOW() - (%s || ' days')::interval
+      AND UPPER(ls.side) = %s
+      AND ls.buy_sell_ratio >= %s
+      AND ls.buy_sell_ratio < %s
+    ''', (ADAPTIVE_LOOKBACK_DAYS, side, low, high))
+    closed, wins, avg_pnl = cur.fetchone()
+    closed = int(closed or 0)
+    wins = int(wins or 0)
+    winrate = wins / closed if closed else None
+    if closed >= BUY_BUCKET_MIN_CLOSED:
+        avg = float(avg_pnl or 0)
+        if performance_blocks(closed, winrate, avg_pnl):
+            return True, f'buy bucket blocked {low:.1f}-{high:.1f} n={closed} win={winrate*100:.1f}% avg={avg:.2f}%'
+        return False, f'buy bucket ok {low:.1f}-{high:.1f} n={closed} win={(winrate or 0)*100:.1f}% avg={avg:.2f}%'
+
+    if buy_sell_ratio is not None and float(buy_sell_ratio) > SHORT_MAX_UNLEARNED_BUY_SELL_RATIO:
+        return True, f'buy pressure blocked unlearned ratio={float(buy_sell_ratio):.2f} n={closed}/{BUY_BUCKET_MIN_CLOSED} buys={buys} sells={sells} traders={traders}'
+    return False, f'buy pressure learning ratio={float(buy_sell_ratio):.2f} n={closed}/{BUY_BUCKET_MIN_CLOSED} buys={buys} sells={sells} traders={traders}'
 
 
 if not SKIP_SCHEMA_ENSURE:
@@ -404,6 +471,9 @@ WITH candidate_base AS (
         lf.age_seconds,
         lf.snapshots,
         lf.buy_sell_ratio,
+        lf.buys,
+        lf.sells,
+        lf.traders,
         UPPER(ss.side) AS side,
         ss.strategy,
         ss.entry_threshold,
@@ -450,7 +520,7 @@ WITH candidate_base AS (
 )
 SELECT
     token_id, mode, current_price, current_return_pct, max_pump_pct, max_drawdown_pct,
-    age_seconds, snapshots, buy_sell_ratio, side, strategy, entry_threshold, take_profit,
+    age_seconds, snapshots, buy_sell_ratio, buys, sells, traders, side, strategy, entry_threshold, take_profit,
     stop_loss, trades, winrate, avg_pnl, median_pnl, worst_pnl
 FROM candidate_base
 WHERE strategy_rank <= %s
@@ -476,7 +546,7 @@ skipped = {}
 for row in rows:
     (
         token_id, mode, current_price, current_return, max_pump, max_dd, age, snapshots,
-        bsr, side, strategy, entry_threshold, take_profit, stop_loss,
+        bsr, buys, sells, traders, side, strategy, entry_threshold, take_profit, stop_loss,
         trades, winrate, avg_pnl, med_pnl, worst_pnl,
     ) = row
 
@@ -492,6 +562,8 @@ for row in rows:
     if snapshots < MIN_SNAPSHOTS:
         skip('too_few_snapshots')
         continue
+    if MAX_NEW_SIGNALS_PER_CYCLE > 0 and created >= MAX_NEW_SIGNALS_PER_CYCLE:
+        break
 
     threshold_pct = (entry_threshold - 1.0) * 100.0
     if side == 'SHORT':
@@ -512,6 +584,10 @@ for row in rows:
             continue
         if max_pump < threshold_pct:
             skip('strategy_threshold_not_met')
+            continue
+        buy_blocked, buy_reason = buy_pressure_gate(side, bsr, buys, sells, traders)
+        if buy_blocked:
+            skip('buy_pressure_blocked', buy_reason)
             continue
     elif side == 'LONG':
         if max_dd is None:
@@ -598,8 +674,9 @@ for row in rows:
         historical_trades, historical_winrate, historical_avg_pnl, historical_median_pnl,
         historical_worst_pnl, reason, created_at, signal_status,
         live_snapshots, max_pump_pct, reversal_from_peak_pct, cluster_name, cluster_risk,
-        adaptive_adjustment, adaptive_reason, liquidation_price, reward_pct, risk_pct, reward_risk
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        adaptive_adjustment, adaptive_reason, liquidation_price, reward_pct, risk_pct, reward_risk,
+        buy_sell_ratio, buys, sells, traders
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     RETURNING id
     ''', (
         token_id, mode, side, f'{side}_SIGNAL', label, conf,
@@ -609,6 +686,7 @@ for row in rows:
         snapshots, max_pump, setup_move, cluster_name, cluster_risk,
         adaptive_adjustment, adaptive_reason,
         liquidation_price, reward_pct, risk_pct, reward_risk,
+        bsr, buys, sells, traders,
     ))
     signal_id = cur.fetchone()[0]
 

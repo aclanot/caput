@@ -15,10 +15,11 @@ SIGNAL_CHAT_ID = os.getenv('TELEGRAM_SIGNAL_CHAT_ID')
 INTERVAL_SECONDS = float(os.getenv('SIGNAL_BROADCASTER_INTERVAL_SECONDS', '10'))
 MAX_SIGNAL_AGE_MINUTES = int(os.getenv('SIGNAL_BROADCASTER_MAX_SIGNAL_AGE_MINUTES', '10'))
 PAPER_START_BALANCE_USDT = float(os.getenv('PAPER_START_BALANCE_USDT', '1000'))
-PAPER_TRADE_SIZE_USDT = float(os.getenv('PAPER_TRADE_SIZE_USDT', '100'))
+PAPER_TRADE_SIZE_USDT = float(os.getenv('PAPER_TRADE_SIZE_USDT', '50'))
 PAPER_AUTO_OPEN = os.getenv('PAPER_AUTO_OPEN', 'true').lower() in ('1', 'true', 'yes', 'on')
-PAPER_MAX_OPEN_TRADES = int(os.getenv('PAPER_MAX_OPEN_TRADES', '10'))
-PAPER_MAX_POSITION_PCT = float(os.getenv('PAPER_MAX_POSITION_PCT', '10'))
+PAPER_MAX_OPEN_TRADES = int(os.getenv('PAPER_MAX_OPEN_TRADES', '2'))
+PAPER_MAX_POSITION_PCT = float(os.getenv('PAPER_MAX_POSITION_PCT', '5'))
+PAPER_MAX_NEW_OPENS_PER_CYCLE = int(os.getenv('PAPER_MAX_NEW_OPENS_PER_CYCLE', '1'))
 SHORT_TP_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_TP_PCT', '12'))
 SHORT_SL_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_SL_PCT', '18'))
 LONG_TP_PCT = float(os.getenv('LIVE_SIGNAL_LONG_TP_PCT', '12'))
@@ -344,6 +345,8 @@ def open_missing_paper_trades():
     cur.execute("SELECT COUNT(*) FROM paper_signal_trades WHERE status = 'OPEN'")
     open_count = cur.fetchone()[0]
     slots = max_open_trades() - int(open_count or 0)
+    if PAPER_MAX_NEW_OPENS_PER_CYCLE > 0:
+        slots = min(slots, PAPER_MAX_NEW_OPENS_PER_CYCLE)
     if slots <= 0:
         return 0
 
