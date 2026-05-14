@@ -55,6 +55,18 @@ def table_exists(cur, table_name):
     return cur.fetchone()[0] is not None
 
 
+def column_exists(cur, table_name, column_name):
+    cur.execute('''
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s
+        LIMIT 1
+    ''', (table_name, column_name))
+    return cur.fetchone() is not None
+
+
 def existing_tables(table_names):
     cur = conn.cursor()
     return [name for name in table_names if table_exists(cur, name)]
@@ -105,10 +117,79 @@ def write_table_csv_to_zip(cur, zip_file, table_name):
     return len(rows)
 
 
+def latest_collector_log(cur):
+    if not table_exists(cur, 'official_api_collector_log'):
+        return None
+    has_status = column_exists(cur, 'official_api_collector_log', 'status')
+    has_note = column_exists(cur, 'official_api_collector_log', 'note')
+    has_event_type = column_exists(cur, 'official_api_collector_log', 'event_type')
+    has_error_message = column_exists(cur, 'official_api_collector_log', 'error_message')
+
+    status_expr = 'status' if has_status else 'event_type' if has_event_type else "'unknown'"
+    note_expr = 'note' if has_note else 'error_message' if has_error_message else "''"
+    cur.execute(f'''
+        SELECT ts, {status_expr} AS status, {note_expr} AS note
+        FROM official_api_collector_log
+        ORDER BY id DESC
+        LIMIT 1
+    ''')
+    return cur.fetchone()
+
+
+def arg_limit(context, default=10, maximum=50):
+    for arg in context.args:
+        try:
+            value = int(arg)
+        except ValueError:
+            continue
+        return max(1, min(maximum, value))
+    return default
+
+
+def arg_side(context):
+    for arg in context.args:
+        value = arg.upper()
+        if value in ('LONG', 'SHORT'):
+            return value
+    return None
+
+
+def fmt_pct(value):
+    if value is None:
+        return 'n/a'
+    return f'{float(value):.2f}%'
+
+
+def fmt_price(value):
+    if value is None:
+        return 'n/a'
+    value = float(value)
+    if abs(value) >= 100:
+        return f'{value:.2f}'
+    if abs(value) >= 1:
+        return f'{value:.4f}'
+    return f'{value:.8f}'
+
+
+def fmt_money(value):
+    if value is None:
+        return 'n/a'
+    return f'${float(value):.2f}'
+
+
+async def reply_text(update, text):
+    for start in range(0, len(text), 3900):
+        await update.message.reply_text(text[start:start + 3900])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         'Caput bot online\n\n'
         '/status - collector and dataset status\n'
+        '/summary - compact live and strategy summary\n'
+        '/calls [long|short] [limit] - best recent live calls\n'
+        '/paper [limit] - latest live paper trades\n'
+        '/sweep [long|short] [limit] - best historical strategies\n'
         '/backup - export DB CSV ZIP\n'
         '/pg_dump_essential - smallest PostgreSQL dump, best for Telegram\n'
         '/pg_dump_core - PostgreSQL dump without token_snapshots/logs\n'
@@ -145,6 +226,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute('SELECT COUNT(*) FROM official_api_token_state')
         state_count = cur.fetchone()[0]
 
+    collector_log = latest_collector_log(cur)
+    collector_text = 'Collector log: n/a'
+    if collector_log:
+        log_ts, log_status, log_note = collector_log
+        collector_text = f'Collector log: {log_ts} | {log_status} | {(log_note or "")[:300]}'
+
     text = (
         'Status\n\n'
         f'Finished trajectories: {finished}\n'
@@ -154,9 +241,237 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'Paper simulation trades: {paper}\n'
         f'Sweep rows: {sweep_count}\n'
         f'Last snapshot: {last_snapshot}\n\n'
+        f'{collector_text}\n\n'
         'Run order: official_api_collector -> fast_finished_collector -> auto_run.py -> clusters.py'
     )
     await update.message.reply_text(text)
+
+
+async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    lines = ['Summary', '']
+
+    for table_name, label in [
+        ('finished_tokens', 'Finished trajectories'),
+        ('trajectory_features', 'Analysis rows'),
+        ('strategy_sweep', 'Sweep rows'),
+        ('live_token_features', 'Live feature rows'),
+        ('live_signals', 'Live calls'),
+        ('paper_signal_trades', 'Live paper trades'),
+    ]:
+        if table_exists(cur, table_name):
+            cur.execute(f'SELECT COUNT(*) FROM {safe_identifier(table_name)}')
+            lines.append(f'{label}: {cur.fetchone()[0]}')
+
+    if table_exists(cur, 'live_signals'):
+        lines.extend(['', 'Recent calls by side:'])
+        cur.execute('''
+        SELECT UPPER(COALESCE(side, 'UNKNOWN')) AS side,
+               COUNT(*) AS n,
+               MAX(confidence_pct) AS max_conf,
+               AVG(confidence_pct) AS avg_conf,
+               MAX(created_at) AS last_created
+        FROM live_signals
+        WHERE created_at >= NOW() - interval '24 hours'
+        GROUP BY UPPER(COALESCE(side, 'UNKNOWN'))
+        ORDER BY max_conf DESC NULLS LAST, n DESC
+        ''')
+        rows = cur.fetchall()
+        if rows:
+            for side, n, max_conf, avg_conf, last_created in rows:
+                lines.append(f'{side}: n={n} max_conf={max_conf or 0}% avg_conf={(avg_conf or 0):.1f}% last={last_created}')
+        else:
+            lines.append('No calls in last 24h')
+
+    if table_exists(cur, 'paper_account'):
+        cur.execute("SELECT balance_usdt, updated_at FROM paper_account WHERE account_key = 'default'")
+        row = cur.fetchone()
+        if row:
+            balance_usdt, updated_at = row
+            lines.extend(['', f'Paper account: {fmt_money(balance_usdt)} updated={updated_at}'])
+
+    if table_exists(cur, 'paper_signal_trades'):
+        lines.extend(['', 'Paper trades:'])
+        cur.execute('''
+        SELECT UPPER(COALESCE(side, 'UNKNOWN')) AS side,
+               status,
+               COUNT(*) AS n,
+               AVG(pnl_pct) FILTER (WHERE pnl_pct IS NOT NULL) AS avg_pnl
+        FROM paper_signal_trades
+        GROUP BY UPPER(COALESCE(side, 'UNKNOWN')), status
+        ORDER BY side, status
+        ''')
+        for side, status_name, n, avg_pnl in cur.fetchall():
+            lines.append(f'{side} {status_name}: n={n} avg_pnl={fmt_pct(avg_pnl)}')
+
+    if table_exists(cur, 'strategy_sweep'):
+        lines.extend(['', 'Best strategies by side:'])
+        cur.execute('''
+        SELECT DISTINCT ON (UPPER(side))
+               UPPER(side) AS side, mode, strategy, trades, winrate, avg_pnl
+        FROM strategy_sweep
+        WHERE UPPER(side) IN ('LONG', 'SHORT')
+        ORDER BY UPPER(side), avg_pnl DESC, winrate DESC, trades DESC
+        ''')
+        for side, mode, strategy, trades, winrate, avg_pnl in cur.fetchall():
+            lines.append(f'{side} {mode} {strategy} n={trades} win={winrate*100:.1f}% avg={avg_pnl:.2f}%')
+
+    await reply_text(update, '\n'.join(lines))
+
+
+async def calls_for_side(update: Update, context: ContextTypes.DEFAULT_TYPE, forced_side=None):
+    cur = conn.cursor()
+    if not table_exists(cur, 'live_signals'):
+        await update.message.reply_text('live_signals table does not exist yet.')
+        return
+
+    limit = arg_limit(context)
+    side = forced_side or arg_side(context)
+    params = []
+    side_sql = ''
+    if side:
+        side_sql = 'AND UPPER(side) = %s'
+        params.append(side)
+    params.append(limit)
+
+    cur.execute(f'''
+    SELECT token_id, mode, UPPER(side), confidence_pct, current_price,
+           take_profit_price, stop_loss_price, matched_strategy,
+           historical_trades, historical_winrate, historical_avg_pnl,
+           cluster_name, cluster_risk, reversal_from_peak_pct, created_at
+    FROM live_signals
+    WHERE created_at >= NOW() - interval '24 hours'
+      {side_sql}
+    ORDER BY confidence_pct DESC NULLS LAST,
+             historical_avg_pnl DESC NULLS LAST,
+             historical_winrate DESC NULLS LAST,
+             created_at DESC
+    LIMIT %s
+    ''', params)
+    rows = cur.fetchall()
+    if not rows:
+        await update.message.reply_text('No recent calls found.')
+        return
+
+    lines = [f'Calls top {len(rows)}' + (f' {side}' if side else ''), '']
+    for row in rows:
+        (
+            token_id, mode, row_side, confidence_pct, current_price,
+            tp, sl, strategy, trades, winrate, avg_pnl,
+            cluster_name, cluster_risk, setup_move, created_at,
+        ) = row
+        setup_label = 'drawdown' if row_side == 'LONG' else 'reversal'
+        lines.append(
+            f'{row_side} {mode} conf={confidence_pct}% avg={avg_pnl:.2f}% win={winrate*100:.1f}% n={trades}\n'
+            f'{token_id} price={fmt_price(current_price)} tp={fmt_price(tp)} sl={fmt_price(sl)} {setup_label}={(setup_move or 0):.2f}%\n'
+            f'{strategy} | {cluster_name or "n/a"}/{cluster_risk or "n/a"} | {created_at}'
+        )
+        lines.append('')
+
+    await reply_text(update, '\n'.join(lines).strip())
+
+
+async def calls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await calls_for_side(update, context)
+
+
+async def long_calls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await calls_for_side(update, context, forced_side='LONG')
+
+
+async def short_calls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await calls_for_side(update, context, forced_side='SHORT')
+
+
+async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    if not table_exists(cur, 'paper_signal_trades'):
+        await update.message.reply_text('paper_signal_trades table does not exist yet.')
+        return
+
+    limit = arg_limit(context)
+    has_virtual = column_exists(cur, 'paper_signal_trades', 'virtual_position_usdt')
+    if has_virtual:
+        cur.execute('''
+        SELECT token_id, mode, UPPER(side), status, confidence_pct,
+               entry_price, take_profit_price, stop_loss_price, close_price,
+               pnl_pct, close_reason, opened_at, closed_at,
+               virtual_position_usdt, virtual_pnl_usdt, virtual_balance_after_close
+        FROM paper_signal_trades
+        ORDER BY COALESCE(closed_at, opened_at) DESC NULLS LAST, id DESC
+        LIMIT %s
+        ''', (limit,))
+    else:
+        cur.execute('''
+        SELECT token_id, mode, UPPER(side), status, confidence_pct,
+               entry_price, take_profit_price, stop_loss_price, close_price,
+               pnl_pct, close_reason, opened_at, closed_at,
+               NULL, NULL, NULL
+        FROM paper_signal_trades
+        ORDER BY COALESCE(closed_at, opened_at) DESC NULLS LAST, id DESC
+        LIMIT %s
+        ''', (limit,))
+    rows = cur.fetchall()
+    if not rows:
+        await update.message.reply_text('No live paper trades yet.')
+        return
+
+    lines = [f'Latest paper trades top {len(rows)}', '']
+    for row in rows:
+        (
+            token_id, mode, side, status_name, confidence_pct,
+            entry, tp, sl, close, pnl, close_reason, opened_at, closed_at,
+            virtual_position, virtual_pnl, virtual_balance_after,
+        ) = row
+        lines.append(
+            f'{side} {mode} {status_name} conf={confidence_pct}% pnl={fmt_pct(pnl)} reason={close_reason or "open"}\n'
+            f'virtual_position={fmt_money(virtual_position)} virtual_pnl={fmt_money(virtual_pnl)} balance_after={fmt_money(virtual_balance_after)}\n'
+            f'{token_id} entry={fmt_price(entry)} tp={fmt_price(tp)} sl={fmt_price(sl)} close={fmt_price(close)}\n'
+            f'opened={opened_at} closed={closed_at}'
+        )
+        lines.append('')
+
+    await reply_text(update, '\n'.join(lines).strip())
+
+
+async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    if not table_exists(cur, 'strategy_sweep'):
+        await update.message.reply_text('strategy_sweep table does not exist yet. Run auto_run.py first.')
+        return
+
+    limit = arg_limit(context, default=20)
+    side = arg_side(context)
+    params = []
+    side_sql = ''
+    if side:
+        side_sql = 'AND UPPER(side) = %s'
+        params.append(side)
+    params.append(limit)
+
+    cur.execute(f'''
+    SELECT mode, UPPER(side), strategy, trades, winrate, avg_pnl,
+           median_pnl, worst_pnl, best_pnl
+    FROM strategy_sweep
+    WHERE UPPER(side) IN ('LONG', 'SHORT')
+      {side_sql}
+    ORDER BY avg_pnl DESC, winrate DESC, trades DESC
+    LIMIT %s
+    ''', params)
+    rows = cur.fetchall()
+    if not rows:
+        await update.message.reply_text('No sweep rows match.')
+        return
+
+    lines = [f'Sweep top {len(rows)}' + (f' {side}' if side else ''), '']
+    for mode, row_side, strategy, trades, winrate, avg_pnl, med, worst, best in rows:
+        lines.append(
+            f'{row_side} {mode} {strategy}\n'
+            f'n={trades} win={winrate*100:.1f}% avg={avg_pnl:.2f}% med={med:.2f}% worst={worst:.2f}% best={best:.2f}%'
+        )
+        lines.append('')
+
+    await reply_text(update, '\n'.join(lines).strip())
 
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -252,6 +567,12 @@ app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler('start', start))
 app.add_handler(CommandHandler('status', status))
 app.add_handler(CommandHandler('stats', status))
+app.add_handler(CommandHandler('summary', summary))
+app.add_handler(CommandHandler('calls', calls))
+app.add_handler(CommandHandler('long', long_calls))
+app.add_handler(CommandHandler('short', short_calls))
+app.add_handler(CommandHandler('paper', paper))
+app.add_handler(CommandHandler('sweep', sweep))
 app.add_handler(CommandHandler('backup', backup))
 app.add_handler(CommandHandler('pg_dump', pg_dump_backup))
 app.add_handler(CommandHandler('pg_dump_core', pg_dump_core))
