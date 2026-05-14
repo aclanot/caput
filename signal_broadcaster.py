@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -12,12 +13,19 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 SIGNAL_CHAT_ID = os.getenv('TELEGRAM_SIGNAL_CHAT_ID')
 INTERVAL_SECONDS = float(os.getenv('SIGNAL_BROADCASTER_INTERVAL_SECONDS', '10'))
-MAX_SIGNAL_AGE_MINUTES = int(os.getenv('SIGNAL_BROADCASTER_MAX_SIGNAL_AGE_MINUTES', '60'))
+MAX_SIGNAL_AGE_MINUTES = int(os.getenv('SIGNAL_BROADCASTER_MAX_SIGNAL_AGE_MINUTES', '10'))
 PAPER_START_BALANCE_USDT = float(os.getenv('PAPER_START_BALANCE_USDT', '1000'))
 PAPER_TRADE_SIZE_USDT = float(os.getenv('PAPER_TRADE_SIZE_USDT', '100'))
 PAPER_AUTO_OPEN = os.getenv('PAPER_AUTO_OPEN', 'true').lower() in ('1', 'true', 'yes', 'on')
 PAPER_MAX_OPEN_TRADES = int(os.getenv('PAPER_MAX_OPEN_TRADES', '10'))
 PAPER_MAX_POSITION_PCT = float(os.getenv('PAPER_MAX_POSITION_PCT', '10'))
+SHORT_TP_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_TP_PCT', '12'))
+SHORT_SL_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_SL_PCT', '18'))
+LONG_TP_PCT = float(os.getenv('LIVE_SIGNAL_LONG_TP_PCT', '12'))
+LONG_SL_PCT = float(os.getenv('LIVE_SIGNAL_LONG_SL_PCT', '18'))
+PAPER_STALE_CLOSE_SECONDS = int(os.getenv('PAPER_STALE_CLOSE_SECONDS', '180'))
+PAPER_MAX_HOLD_SECONDS = int(os.getenv('PAPER_MAX_HOLD_SECONDS', '600'))
+MAX_TELEGRAM_SENDS_PER_CYCLE = int(os.getenv('SIGNAL_BROADCASTER_MAX_SENDS_PER_CYCLE', '3'))
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -29,6 +37,11 @@ if not SIGNAL_CHAT_ID:
 conn = psycopg.connect(DATABASE_URL)
 conn.autocommit = True
 cur = conn.cursor()
+next_telegram_send_at = 0.0
+
+
+class TelegramRateLimited(Exception):
+    pass
 
 
 def utcnow():
@@ -114,6 +127,10 @@ def ensure_schema():
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS capital_reserved BOOLEAN DEFAULT FALSE',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS last_mark_price DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS last_pnl_pct DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS last_pnl_usdt DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS last_marked_at TIMESTAMP',
     ])
 
     cur.execute('''
@@ -214,6 +231,40 @@ def paper_pnl_pct(side, entry_price, current_price, leverage, close_reason=None)
     else:
         raw_pct = (current_price / entry_price - 1.0) * 100.0
     return max(-100.0, raw_pct * leverage)
+
+
+def capped_exit_prices(side, entry_price, tp=None, sl=None):
+    if entry_price is None or entry_price <= 0:
+        return tp, sl
+    side = str(side or '').upper()
+    entry_price = float(entry_price)
+    if side == 'SHORT':
+        capped_tp = entry_price * (1.0 - SHORT_TP_PCT / 100.0)
+        capped_sl = entry_price * (1.0 + SHORT_SL_PCT / 100.0)
+        if tp is None or tp >= entry_price or tp < capped_tp:
+            tp = capped_tp
+        if sl is None or sl <= entry_price or sl > capped_sl:
+            sl = capped_sl
+    else:
+        capped_tp = entry_price * (1.0 + LONG_TP_PCT / 100.0)
+        capped_sl = entry_price * (1.0 - LONG_SL_PCT / 100.0)
+        if tp is None or tp <= entry_price or tp > capped_tp:
+            tp = capped_tp
+        if sl is None or sl >= entry_price or sl < capped_sl:
+            sl = capped_sl
+    return tp, sl
+
+
+def risk_metrics(side, entry_price, take_profit_price, stop_loss_price):
+    if not entry_price or entry_price <= 0 or not take_profit_price or not stop_loss_price:
+        return None, None, None
+    if str(side or '').upper() == 'SHORT':
+        reward_pct = max(0.0, (entry_price / take_profit_price - 1.0) * 100.0)
+        risk_pct = max(0.0, (stop_loss_price / entry_price - 1.0) * 100.0)
+    else:
+        reward_pct = max(0.0, (take_profit_price / entry_price - 1.0) * 100.0)
+        risk_pct = max(0.0, (entry_price / stop_loss_price - 1.0) * 100.0)
+    return reward_pct, risk_pct, reward_pct / risk_pct if risk_pct > 0 else None
 
 
 def account_balance():
@@ -322,6 +373,8 @@ def open_missing_paper_trades():
             entry_price, tp, sl, max_leverage,
             liquidation_price, reward_pct, risk_pct, reward_risk,
         ) = row
+        tp, sl = capped_exit_prices(side, entry_price, tp, sl)
+        reward_pct, risk_pct, reward_risk = risk_metrics(side, entry_price, tp, sl)
         balance = account_balance()
         position_size = effective_trade_size(balance)
         if position_size <= 0 or balance < position_size:
@@ -349,7 +402,41 @@ def open_missing_paper_trades():
     return opened
 
 
+def normalize_open_trade_exits():
+    cur.execute('''
+    SELECT id, UPPER(side), entry_price, take_profit_price, stop_loss_price
+    FROM paper_signal_trades
+    WHERE status = 'OPEN'
+    ORDER BY id ASC
+    LIMIT 500
+    ''')
+    changed = 0
+    for trade_id, side, entry_price, tp, sl in cur.fetchall():
+        new_tp, new_sl = capped_exit_prices(side, entry_price, tp, sl)
+        if new_tp == tp and new_sl == sl:
+            continue
+        reward_pct, risk_pct, reward_risk = risk_metrics(side, entry_price, new_tp, new_sl)
+        cur.execute('''
+        UPDATE paper_signal_trades
+        SET take_profit_price = %s,
+            stop_loss_price = %s,
+            reward_pct = %s,
+            risk_pct = %s,
+            reward_risk = %s
+        WHERE id = %s
+        ''', (new_tp, new_sl, reward_pct, risk_pct, reward_risk, trade_id))
+        changed += 1
+    if changed:
+        print(f'normalized open paper exits: {changed}', flush=True)
+    return changed
+
+
 def tg_send(text):
+    global next_telegram_send_at
+    now = time.monotonic()
+    if now < next_telegram_send_at:
+        raise TelegramRateLimited(f'Telegram backoff active for {next_telegram_send_at - now:.1f}s')
+
     url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
     payload = {
         'chat_id': SIGNAL_CHAT_ID,
@@ -358,6 +445,16 @@ def tg_send(text):
     }
     response = requests.post(url, json=payload, timeout=30)
     if response.status_code != 200:
+        if response.status_code == 429:
+            retry_after = 30
+            try:
+                retry_after = int(response.json().get('parameters', {}).get('retry_after') or retry_after)
+            except Exception:
+                match = re.search(r'retry after (\d+)', response.text)
+                if match:
+                    retry_after = int(match.group(1))
+            next_telegram_send_at = time.monotonic() + retry_after + 1
+            raise TelegramRateLimited(f'Telegram retry after {retry_after}s')
         raise RuntimeError(f'Telegram send failed {response.status_code}: {response.text[:500]}')
     data = response.json()
     return data.get('result', {}).get('message_id')
@@ -435,7 +532,9 @@ def broadcast_new_signals():
     cur.execute('''
     SELECT
         ls.id, ls.token_id, os.name, os.symbol, ls.mode, ls.side, ls.confidence_pct,
-        ls.current_price, ls.entry_low, ls.entry_high, ls.take_profit_price, ls.stop_loss_price,
+        ls.current_price, ls.entry_low, ls.entry_high,
+        COALESCE(pst.take_profit_price, ls.take_profit_price),
+        COALESCE(pst.stop_loss_price, ls.stop_loss_price),
         ls.max_leverage, ls.matched_strategy, ls.historical_trades, ls.historical_winrate,
         ls.historical_avg_pnl, ls.historical_median_pnl, ls.historical_worst_pnl, ls.current_return_pct,
         ls.cluster_name, ls.cluster_risk, ls.reversal_from_peak_pct, ls.max_pump_pct, ls.live_snapshots,
@@ -452,8 +551,8 @@ def broadcast_new_signals():
              ls.historical_avg_pnl DESC NULLS LAST,
              ls.created_at ASC,
              ls.id ASC
-    LIMIT 10
-    ''', (MAX_SIGNAL_AGE_MINUTES,))
+    LIMIT %s
+    ''', (MAX_SIGNAL_AGE_MINUTES, MAX_TELEGRAM_SENDS_PER_CYCLE))
 
     rows = cur.fetchall()
     sent = 0
@@ -467,6 +566,9 @@ def broadcast_new_signals():
             )
             sent += 1
             print(f'sent signal {signal_id}', flush=True)
+        except TelegramRateLimited as exc:
+            print(f'telegram rate limited while sending signal {signal_id}: {exc}', flush=True)
+            break
         except Exception as exc:
             print(f'failed to send signal {signal_id}: {exc}', flush=True)
     return sent
@@ -474,14 +576,27 @@ def broadcast_new_signals():
 
 def update_open_paper_trades():
     fill_missing_virtual_open_fields()
+    normalize_open_trade_exits()
     cur.execute('''
     SELECT
         pst.id, pst.signal_id, pst.token_id, UPPER(pst.side),
         pst.entry_price, pst.take_profit_price, pst.stop_loss_price,
         pst.max_leverage, pst.virtual_position_usdt, pst.liquidation_price,
-        COALESCE(pst.capital_reserved, false), ltf.current_price
+        COALESCE(pst.capital_reserved, false), pst.opened_at,
+        COALESCE(os.current_price, ltf.current_price, latest.price, pst.last_mark_price) AS current_price,
+        COALESCE(os.updated_at, ltf.last_seen, latest.ts, pst.last_marked_at) AS price_seen_at,
+        os.end_date
     FROM paper_signal_trades pst
     LEFT JOIN live_token_features ltf ON ltf.token_id = pst.token_id
+    LEFT JOIN official_api_token_state os ON os.token_id = pst.token_id
+    LEFT JOIN LATERAL (
+        SELECT ts, price
+        FROM token_snapshots
+        WHERE token_id = pst.token_id
+          AND price IS NOT NULL
+        ORDER BY ts DESC
+        LIMIT 1
+    ) latest ON true
     WHERE pst.status = 'OPEN'
     ORDER BY pst.id ASC
     LIMIT 200
@@ -489,8 +604,13 @@ def update_open_paper_trades():
 
     rows = cur.fetchall()
     closed = 0
+    now = utcnow()
     for row in rows:
-        trade_id, signal_id, token_id, side, entry_price, tp, sl, max_leverage, position_usdt, liquidation_price, capital_reserved, current_price = row
+        (
+            trade_id, signal_id, token_id, side, entry_price, tp, sl, max_leverage,
+            position_usdt, liquidation_price, capital_reserved, opened_at,
+            current_price, price_seen_at, end_date,
+        ) = row
         if current_price is None or entry_price is None or entry_price <= 0:
             continue
 
@@ -510,14 +630,47 @@ def update_open_paper_trades():
             elif sl is not None and current_price <= sl:
                 close_reason = 'SL'
 
+        position_usdt = float(position_usdt or effective_trade_size())
+
         if not close_reason:
+            if end_date is not None and end_date <= now:
+                close_reason = 'EXPIRED'
+            elif price_seen_at is not None and (now - price_seen_at).total_seconds() >= PAPER_STALE_CLOSE_SECONDS:
+                close_reason = 'STALE'
+            elif opened_at is not None and (now - opened_at).total_seconds() >= PAPER_MAX_HOLD_SECONDS:
+                close_reason = 'TIMEOUT'
+
+        if not close_reason:
+            mark_pnl_pct = paper_pnl_pct(side, entry_price, current_price, max_leverage)
+            if mark_pnl_pct is None:
+                continue
+            mark_pnl_usdt = position_usdt * mark_pnl_pct / 100.0
+            cur.execute('''
+            UPDATE paper_signal_trades
+            SET last_mark_price = %s,
+                last_pnl_pct = %s,
+                last_pnl_usdt = %s,
+                last_marked_at = %s
+            WHERE id = %s
+            ''', (current_price, mark_pnl_pct, mark_pnl_usdt, now, trade_id))
             continue
 
-        leveraged_pnl_pct = paper_pnl_pct(side, entry_price, current_price, max_leverage, close_reason)
+        execution_price = current_price
+        if close_reason == 'TP' and tp is not None:
+            execution_price = tp
+        elif close_reason == 'SL' and sl is not None:
+            execution_price = sl
+        elif close_reason == 'LIQUIDATION' and liquidation_price is not None:
+            execution_price = liquidation_price
+
+        leveraged_pnl_pct = paper_pnl_pct(side, entry_price, execution_price, max_leverage, close_reason)
         if leveraged_pnl_pct is None:
             continue
-        position_usdt = float(position_usdt or effective_trade_size())
         virtual_pnl_usdt = position_usdt * leveraged_pnl_pct / 100.0
+        if close_reason == 'LIQUIDATION':
+            leveraged_pnl_pct = -100.0
+            virtual_pnl_usdt = -position_usdt
+
         balance_delta = virtual_pnl_usdt + (position_usdt if capital_reserved else 0.0)
         balance_after = update_account_balance(balance_delta)
 
@@ -531,11 +684,16 @@ def update_open_paper_trades():
             virtual_position_usdt = %s,
             virtual_pnl_usdt = %s,
             virtual_balance_after_close = %s,
-            capital_reserved = false
+            capital_reserved = false,
+            last_mark_price = %s,
+            last_pnl_pct = %s,
+            last_pnl_usdt = %s,
+            last_marked_at = %s
         WHERE id = %s
         ''', (
-            utcnow(), current_price, leveraged_pnl_pct, close_reason,
-            position_usdt, virtual_pnl_usdt, balance_after, trade_id,
+            utcnow(), execution_price, leveraged_pnl_pct, close_reason,
+            position_usdt, virtual_pnl_usdt, balance_after,
+            current_price, leveraged_pnl_pct, virtual_pnl_usdt, now, trade_id,
         ))
         closed += 1
         print(
@@ -560,8 +718,8 @@ def send_closed_trade_results():
     WHERE pst.status = 'CLOSED'
       AND COALESCE(pst.result_sent_to_telegram, false) = false
     ORDER BY pst.closed_at ASC
-    LIMIT 20
-    ''')
+    LIMIT %s
+    ''', (MAX_TELEGRAM_SENDS_PER_CYCLE,))
     rows = cur.fetchall()
     sent = 0
     for row in rows:
@@ -578,6 +736,9 @@ def send_closed_trade_results():
             'TP': 'TAKE PROFIT',
             'SL': 'STOP LOSS',
             'LIQUIDATION': 'LIQUIDATION',
+            'EXPIRED': 'TOKEN ENDED',
+            'STALE': 'STALE PRICE CLOSE',
+            'TIMEOUT': 'TIMEOUT CLOSE',
         }.get(close_reason, close_reason or 'CLOSED')
         text = (
             f'PAPER CLOSED: {result_label}\n'
@@ -594,6 +755,9 @@ def send_closed_trade_results():
             tg_send(text)
             cur.execute('UPDATE paper_signal_trades SET result_sent_to_telegram = true WHERE id = %s', (trade_id,))
             sent += 1
+        except TelegramRateLimited as exc:
+            print(f'telegram rate limited while sending trade result {trade_id}: {exc}', flush=True)
+            break
         except Exception as exc:
             print(f'failed to send trade result {trade_id}: {exc}', flush=True)
     return sent

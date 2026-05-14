@@ -25,10 +25,10 @@ LONG_MIN_EXPECTANCY = float(os.getenv('LIVE_SIGNALS_LONG_MIN_EXPECTANCY', '5'))
 LONG_MIN_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_LONG_MIN_CONFIDENCE', str(MIN_CONFIDENCE)))
 MIN_PUMP = float(os.getenv('LIVE_SIGNALS_MIN_PUMP_FOR_REVERSAL_PCT', '40'))
 MIN_REVERSAL = float(os.getenv('LIVE_SIGNALS_MIN_REVERSAL_FROM_PEAK_PCT', '10'))
-SHORT_TP_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_TP_PCT', '30'))
-SHORT_SL_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_SL_PCT', '35'))
-LONG_TP_PCT = float(os.getenv('LIVE_SIGNAL_LONG_TP_PCT', '20'))
-LONG_SL_PCT = float(os.getenv('LIVE_SIGNAL_LONG_SL_PCT', '25'))
+SHORT_TP_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_TP_PCT', '12'))
+SHORT_SL_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_SL_PCT', '18'))
+LONG_TP_PCT = float(os.getenv('LIVE_SIGNAL_LONG_TP_PCT', '12'))
+LONG_SL_PCT = float(os.getenv('LIVE_SIGNAL_LONG_SL_PCT', '18'))
 CAP_EXECUTION_STOP = os.getenv('LIVE_SIGNALS_CAP_EXECUTION_STOP', 'true').lower() in ('1', 'true', 'yes', 'on')
 MAX_STRATEGIES_PER_TOKEN_SIDE = int(os.getenv('LIVE_SIGNALS_MAX_STRATEGIES_PER_TOKEN_SIDE', '5'))
 DEBUG_LOG_LIMIT_PER_STATUS = int(os.getenv('LIVE_SIGNALS_DEBUG_LOG_LIMIT_PER_STATUS', '5'))
@@ -242,6 +242,7 @@ def prices_for_signal(side, current_price, current_return_pct=None, strategy_tp=
     if side == 'SHORT':
         tp = None
         sl = None
+        fallback_tp = current_price * (1.0 - SHORT_TP_PCT / 100.0)
         fallback_sl = current_price * (1.0 + SHORT_SL_PCT / 100.0)
         if current_return_pct is not None and current_return_pct > -99:
             initial_price = current_price / (1.0 + current_return_pct / 100.0)
@@ -250,7 +251,9 @@ def prices_for_signal(side, current_price, current_return_pct=None, strategy_tp=
             if strategy_sl and strategy_sl > 1:
                 sl = initial_price * strategy_sl
         if tp is None or tp >= current_price:
-            tp = current_price * (1.0 - SHORT_TP_PCT / 100.0)
+            tp = fallback_tp
+        elif CAP_EXECUTION_STOP:
+            tp = max(tp, fallback_tp)
         if sl is None or sl <= current_price:
             sl = fallback_sl
         elif CAP_EXECUTION_STOP:
@@ -261,6 +264,7 @@ def prices_for_signal(side, current_price, current_return_pct=None, strategy_tp=
         tp = current_price * tp_mult
         sl = current_price * sl_mult
         if CAP_EXECUTION_STOP:
+            tp = min(tp, current_price * (1.0 + LONG_TP_PCT / 100.0))
             sl = max(sl, current_price * (1.0 - LONG_SL_PCT / 100.0))
     return entry_low, entry_high, tp, sl
 

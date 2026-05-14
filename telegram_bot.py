@@ -145,6 +145,10 @@ def ensure_paper_schema(cur):
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
         'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS capital_reserved BOOLEAN DEFAULT FALSE',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS last_mark_price DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS last_pnl_pct DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS last_pnl_usdt DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS last_marked_at TIMESTAMP',
     ]:
         cur.execute(ddl)
     reserve_existing_open_positions(cur)
@@ -240,11 +244,14 @@ def paper_account_snapshot(cur):
     balance = account_balance(cur)
     cur.execute('''
     SELECT
-        pst.id, UPPER(pst.side), pst.entry_price, ltf.current_price,
+        pst.id, UPPER(pst.side), pst.entry_price,
+        COALESCE(os.current_price, ltf.current_price, pst.last_mark_price) AS current_price,
         pst.max_leverage, pst.virtual_position_usdt,
-        pst.liquidation_price, COALESCE(pst.capital_reserved, false)
+        pst.liquidation_price, COALESCE(pst.capital_reserved, false),
+        pst.last_pnl_usdt
     FROM paper_signal_trades pst
     LEFT JOIN live_token_features ltf ON ltf.token_id = pst.token_id
+    LEFT JOIN official_api_token_state os ON os.token_id = pst.token_id
     WHERE pst.status = 'OPEN'
     ''')
     open_rows = cur.fetchall()
@@ -252,7 +259,7 @@ def paper_account_snapshot(cur):
     unreserved = 0.0
     unrealized = 0.0
     priced = 0
-    for _, side, entry_price, current_price, leverage, position_usdt, liquidation_price, capital_reserved in open_rows:
+    for _, side, entry_price, current_price, leverage, position_usdt, liquidation_price, capital_reserved, last_pnl_usdt in open_rows:
         position_usdt = float(position_usdt or 0)
         if capital_reserved:
             reserved += position_usdt
@@ -267,6 +274,9 @@ def paper_account_snapshot(cur):
         pnl_pct = paper_pnl_pct(side, entry_price, current_price, leverage, close_reason)
         if pnl_pct is not None:
             unrealized += position_usdt * pnl_pct / 100.0
+            priced += 1
+        elif last_pnl_usdt is not None:
+            unrealized += float(last_pnl_usdt or 0)
             priced += 1
     equity = balance + reserved + unreserved + unrealized
     return {
@@ -832,9 +842,12 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SELECT pst.signal_id, pst.token_id, os.name, os.symbol, pst.mode, UPPER(pst.side),
            pst.status, pst.entry_price, pst.take_profit_price, pst.stop_loss_price,
            pst.close_price, pst.pnl_pct, pst.close_reason,
-           pst.virtual_position_usdt, pst.virtual_pnl_usdt, pst.virtual_balance_after_close
+           pst.virtual_position_usdt, pst.virtual_pnl_usdt, pst.virtual_balance_after_close,
+           COALESCE(os.current_price, ltf.current_price, pst.last_mark_price) AS mark_price,
+           pst.last_pnl_pct, pst.last_pnl_usdt, pst.last_marked_at
     FROM paper_signal_trades pst
     LEFT JOIN official_api_token_state os ON os.token_id = pst.token_id
+    LEFT JOIN live_token_features ltf ON ltf.token_id = pst.token_id
     ORDER BY COALESCE(pst.closed_at, pst.opened_at) DESC NULLS LAST, pst.id DESC
     LIMIT %s
     ''', (limit,))
@@ -849,8 +862,14 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
             signal_id, token_id, name, symbol, mode, side, status_name,
             entry, tp, sl, close, pnl, close_reason,
             virtual_position, virtual_pnl, virtual_balance_after,
+            mark_price, last_pnl_pct, last_pnl_usdt, last_marked_at,
         ) = row
-        close_text = f'Close {fmt_price(close)} | PnL {fmt_pct(pnl)}' if close is not None else 'Still open'
+        if close is not None:
+            close_text = f'Close {fmt_price(close)} | PnL {fmt_pct(pnl)} ({fmt_money(virtual_pnl)})'
+        elif last_pnl_pct is not None:
+            close_text = f'Now {fmt_price(mark_price)} | uPnL {fmt_pct(last_pnl_pct)} ({fmt_money(last_pnl_usdt)})'
+        else:
+            close_text = f'Now {fmt_price(mark_price)} | uPnL n/a'
         lines.append(
             f'#{signal_id} {status_name} {side} {mode}\n'
             f'{token_label(name, symbol, token_id)}\n'
