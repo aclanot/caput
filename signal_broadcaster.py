@@ -27,6 +27,7 @@ LONG_SL_PCT = float(os.getenv('LIVE_SIGNAL_LONG_SL_PCT', '18'))
 PAPER_STALE_CLOSE_SECONDS = int(os.getenv('PAPER_STALE_CLOSE_SECONDS', '180'))
 PAPER_MAX_HOLD_SECONDS = int(os.getenv('PAPER_MAX_HOLD_SECONDS', '600'))
 MAX_TELEGRAM_SENDS_PER_CYCLE = int(os.getenv('SIGNAL_BROADCASTER_MAX_SENDS_PER_CYCLE', '3'))
+ORDER_LOG_SOURCE_NAME = os.getenv('ORDER_LOG_SOURCE_NAME', 'caput_paper_bot')
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -480,6 +481,15 @@ def fmt_money(value):
     return f'${float(value):.2f}'
 
 
+def fmt_pct_short(value):
+    if value is None:
+        return 'n/a'
+    value = float(value)
+    if abs(value - round(value)) < 0.05:
+        return f'{round(value):.0f}%'
+    return f'{value:.2f}%'
+
+
 def fmt_liquidation(value, leverage):
     if value is not None:
         return fmt_price(value)
@@ -498,6 +508,11 @@ def token_label(name, symbol, token_id):
     return f'Token {token_id}'
 
 
+def active_paper_count():
+    cur.execute("SELECT COUNT(*) FROM paper_signal_trades WHERE status = 'OPEN'")
+    return int(cur.fetchone()[0] or 0)
+
+
 def signal_message(row):
     (
         signal_id, token_id, token_name, token_symbol, mode, side, confidence_pct,
@@ -510,20 +525,23 @@ def signal_message(row):
     ) = row
 
     token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
-    title = 'PAPER CALL' if virtual_position_usdt is not None else 'CALL'
-    paper_line = ''
     if virtual_position_usdt is not None:
-        paper_line = f'Paper: {fmt_money(virtual_position_usdt)} | Free: {fmt_money(virtual_balance_at_open)}\n'
+        position = float(virtual_position_usdt or 0)
+        balance_after_open = float(virtual_balance_at_open or 0)
+        balance_before_open = balance_after_open + position
+        pct = (position / balance_before_open * 100.0) if balance_before_open > 0 else None
+        active = active_paper_count()
+        return (
+            f'[#{signal_id}] from {ORDER_LOG_SOURCE_NAME}: starting (active: {active}/{max_open_trades()})\n'
+            f'[#{signal_id}] + {token_url}\n'
+            f'[#{signal_id}]  Balance {fmt_money(balance_before_open)}  {fmt_pct_short(pct)} = {fmt_money(position)}\n'
+            f'[#{signal_id}]  Paper {side.title()} submitted ({fmt_money(position)})'
+        )
+
     return (
-        f'{title}\n'
-        f'{token_label(token_name, token_symbol, token_id)}\n'
-        f'{side} {mode}\n'
-        f'Entry: {fmt_price(current_price)}\n'
-        f'TP: {fmt_price(take_profit_price)}\n'
-        f'SL: {fmt_price(stop_loss_price)}\n'
-        f'{paper_line}'
-        f'Link: {token_url}\n'
-        f'ID: {signal_id}'
+        f'[#{signal_id}] from {ORDER_LOG_SOURCE_NAME}: signal only\n'
+        f'[#{signal_id}] + {token_url}\n'
+        f'[#{signal_id}]  {side.title()} entry {fmt_price(current_price)} TP {fmt_price(take_profit_price)} SL {fmt_price(stop_loss_price)}'
     )
 
 
