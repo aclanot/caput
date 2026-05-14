@@ -16,6 +16,11 @@ BACKUP_MAX_ROWS_PER_TABLE = int(os.getenv('BACKUP_MAX_ROWS_PER_TABLE', '0'))
 BACKUP_INCLUDE_SNAPSHOTS = os.getenv('BACKUP_INCLUDE_SNAPSHOTS', 'true').lower() in ('1', 'true', 'yes', 'on')
 PG_DUMP_TIMEOUT_SECONDS = int(os.getenv('PG_DUMP_TIMEOUT_SECONDS', '600'))
 TELEGRAM_MAX_UPLOAD_MB = float(os.getenv('TELEGRAM_MAX_UPLOAD_MB', '45'))
+PAPER_START_BALANCE_USDT = float(os.getenv('PAPER_START_BALANCE_USDT', '1000'))
+PAPER_TRADE_SIZE_USDT = float(os.getenv('PAPER_TRADE_SIZE_USDT', '100'))
+PAPER_AUTO_OPEN = os.getenv('PAPER_AUTO_OPEN', 'true').lower() in ('1', 'true', 'yes', 'on')
+PAPER_MAX_OPEN_TRADES = int(os.getenv('PAPER_MAX_OPEN_TRADES', '10'))
+PAPER_MAX_POSITION_PCT = float(os.getenv('PAPER_MAX_POSITION_PCT', '10'))
 PG_DUMP_ESSENTIAL_TABLES = [
     'finished_tokens',
     'trajectory_features',
@@ -71,6 +76,106 @@ def ensure_live_signal_columns(cur):
     if not table_exists(cur, 'live_signals'):
         return
     cur.execute("ALTER TABLE live_signals ADD COLUMN IF NOT EXISTS signal_status TEXT DEFAULT 'OPEN'")
+
+
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def ensure_paper_schema(cur):
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS paper_account (
+        account_key TEXT PRIMARY KEY,
+        balance_usdt DOUBLE PRECISION,
+        updated_at TIMESTAMP
+    )
+    ''')
+    cur.execute('''
+    INSERT INTO paper_account(account_key, balance_usdt, updated_at)
+    VALUES ('default', %s, %s)
+    ON CONFLICT(account_key) DO NOTHING
+    ''', (PAPER_START_BALANCE_USDT, utcnow()))
+
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS paper_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT,
+        updated_at TIMESTAMP
+    )
+    ''')
+    cur.executemany('''
+    INSERT INTO paper_settings(setting_key, setting_value, updated_at)
+    VALUES (%s, %s, %s)
+    ON CONFLICT(setting_key) DO NOTHING
+    ''', [
+        ('auto_open', 'true' if PAPER_AUTO_OPEN else 'false', utcnow()),
+        ('trade_size_usdt', str(PAPER_TRADE_SIZE_USDT), utcnow()),
+        ('max_open_trades', str(PAPER_MAX_OPEN_TRADES), utcnow()),
+        ('max_position_pct', str(PAPER_MAX_POSITION_PCT), utcnow()),
+    ])
+
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS paper_signal_trades (
+        id BIGSERIAL PRIMARY KEY,
+        signal_id BIGINT UNIQUE,
+        token_id TEXT,
+        mode TEXT,
+        side TEXT,
+        status TEXT,
+        confidence_pct INT,
+        entry_price DOUBLE PRECISION,
+        take_profit_price DOUBLE PRECISION,
+        stop_loss_price DOUBLE PRECISION,
+        max_leverage DOUBLE PRECISION,
+        opened_at TIMESTAMP,
+        closed_at TIMESTAMP,
+        close_price DOUBLE PRECISION,
+        pnl_pct DOUBLE PRECISION,
+        close_reason TEXT
+    )
+    ''')
+    for ddl in [
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS result_sent_to_telegram BOOLEAN DEFAULT FALSE',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_position_usdt DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_balance_at_open DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_pnl_usdt DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS virtual_balance_after_close DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS liquidation_price DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_pct DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION',
+        'ALTER TABLE paper_signal_trades ADD COLUMN IF NOT EXISTS reward_risk DOUBLE PRECISION',
+    ]:
+        cur.execute(ddl)
+
+
+def paper_setting(cur, key, default):
+    cur.execute('SELECT setting_value FROM paper_settings WHERE setting_key = %s', (key,))
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+def set_paper_setting(cur, key, value):
+    cur.execute('''
+    INSERT INTO paper_settings(setting_key, setting_value, updated_at)
+    VALUES (%s, %s, %s)
+    ON CONFLICT(setting_key) DO UPDATE SET
+        setting_value = EXCLUDED.setting_value,
+        updated_at = EXCLUDED.updated_at
+    ''', (key, str(value), utcnow()))
+
+
+def paper_bool(cur, key, default):
+    fallback = 'true' if default else 'false'
+    return str(paper_setting(cur, key, fallback)).lower() in ('1', 'true', 'yes', 'on')
+
+
+def parse_float_arg(context):
+    for arg in context.args:
+        try:
+            return float(arg.replace('$', '').replace(',', ''))
+        except ValueError:
+            continue
+    return None
 
 
 def existing_tables(table_names):
@@ -196,6 +301,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '/health - pipeline freshness and skip diagnostics\n'
         '/calls [long|short] [limit] - best recent live calls\n'
         '/paper [limit] - latest live paper trades\n'
+        '/paper_account - virtual balance and auto trade settings\n'
+        '/paper_balance [amount] - set virtual balance\n'
+        '/paper_size [amount] - set max virtual position size\n'
+        '/paper_limits [max_open] [max_position_pct] - set paper risk limits\n'
+        '/paper_auto [on|off] - enable or disable auto paper opens\n'
+        '/paper_stats [days] - paper call winrate and PnL\n'
         '/sweep [long|short] [limit] - best historical strategies\n'
         '/backup - export DB CSV ZIP\n'
         '/pg_dump_essential - smallest PostgreSQL dump, best for Telegram\n'
@@ -294,6 +405,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append('No calls in last 24h')
 
     if table_exists(cur, 'paper_account'):
+        ensure_paper_schema(cur)
         cur.execute("SELECT balance_usdt, updated_at FROM paper_account WHERE account_key = 'default'")
         row = cur.fetchone()
         if row:
@@ -301,18 +413,21 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.extend(['', f'Paper account: {fmt_money(balance_usdt)} updated={updated_at}'])
 
     if table_exists(cur, 'paper_signal_trades'):
+        ensure_paper_schema(cur)
         lines.extend(['', 'Paper trades:'])
         cur.execute('''
         SELECT UPPER(COALESCE(side, 'UNKNOWN')) AS side,
                status,
                COUNT(*) AS n,
-               AVG(pnl_pct) FILTER (WHERE pnl_pct IS NOT NULL) AS avg_pnl
+               AVG(pnl_pct) FILTER (WHERE pnl_pct IS NOT NULL) AS avg_pnl,
+               SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) FILTER (WHERE status = 'CLOSED') AS wins
         FROM paper_signal_trades
         GROUP BY UPPER(COALESCE(side, 'UNKNOWN')), status
         ORDER BY side, status
         ''')
-        for side, status_name, n, avg_pnl in cur.fetchall():
-            lines.append(f'{side} {status_name}: n={n} avg_pnl={fmt_pct(avg_pnl)}')
+        for side, status_name, n, avg_pnl, wins in cur.fetchall():
+            win_text = f' wins={wins or 0}' if status_name == 'CLOSED' else ''
+            lines.append(f'{side} {status_name}: n={n}{win_text} avg_pnl={fmt_pct(avg_pnl)}')
 
     if table_exists(cur, 'strategy_sweep'):
         lines.extend(['', 'Best strategies by side:'])
@@ -412,15 +527,22 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             AND trades >= %s
             AND winrate >= %s
             AND avg_pnl >= %s
+            AND median_pnl >= %s
+            AND worst_pnl >= %s
         ) OR (
             UPPER(side) = 'LONG'
             AND trades >= %s
             AND winrate >= %s
             AND avg_pnl >= %s
+            AND median_pnl >= %s
+            AND worst_pnl >= %s
         )
         GROUP BY UPPER(side)
         ORDER BY UPPER(side)
-        ''', (min_trades, min_winrate, min_expectancy, long_min_trades, long_min_winrate, long_min_expectancy))
+        ''', (
+            min_trades, min_winrate, min_expectancy, min_median, max_worst,
+            long_min_trades, long_min_winrate, long_min_expectancy, min_median, max_worst,
+        ))
         rows = cur.fetchall()
         lines.extend(['', 'Eligible strategies:'])
         if rows:
@@ -441,20 +563,24 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   AND ss.trades >= %s
                   AND ss.winrate >= %s
                   AND ss.avg_pnl >= %s
+                  AND ss.median_pnl >= %s
+                  AND ss.worst_pnl >= %s
               )
               OR (
                   UPPER(ss.side) = 'LONG'
                   AND ss.trades >= %s
                   AND ss.winrate >= %s
                   AND ss.avg_pnl >= %s
+                  AND ss.median_pnl >= %s
+                  AND ss.worst_pnl >= %s
               )
           )
         GROUP BY UPPER(ss.side)
         ORDER BY UPPER(ss.side)
         ''', (
             signal_stale,
-            min_trades, min_winrate, min_expectancy,
-            long_min_trades, long_min_winrate, long_min_expectancy,
+            min_trades, min_winrate, min_expectancy, min_median, max_worst,
+            long_min_trades, long_min_winrate, long_min_expectancy, min_median, max_worst,
         ))
         rows = cur.fetchall()
         lines.extend(['', f'Joined candidates fresh {signal_stale}s:'])
@@ -587,6 +713,7 @@ async def short_calls(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
+    ensure_paper_schema(cur)
     if not table_exists(cur, 'paper_signal_trades'):
         await update.message.reply_text('paper_signal_trades table does not exist yet.')
         return
@@ -645,6 +772,207 @@ async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append('')
 
     await reply_text(update, '\n'.join(lines).strip())
+
+
+async def paper_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    ensure_paper_schema(cur)
+    cur.execute("SELECT balance_usdt, updated_at FROM paper_account WHERE account_key = 'default'")
+    balance, updated_at = cur.fetchone()
+    auto_open = paper_bool(cur, 'auto_open', PAPER_AUTO_OPEN)
+    trade_size = float(paper_setting(cur, 'trade_size_usdt', str(PAPER_TRADE_SIZE_USDT)))
+    max_open = int(float(paper_setting(cur, 'max_open_trades', str(PAPER_MAX_OPEN_TRADES))))
+    max_position_pct = float(paper_setting(cur, 'max_position_pct', str(PAPER_MAX_POSITION_PCT)))
+    effective_size = min(trade_size, float(balance or 0) * max_position_pct / 100.0) if max_position_pct > 0 else trade_size
+
+    cur.execute('''
+    SELECT
+        COUNT(*) FILTER (WHERE status = 'OPEN') AS open_count,
+        COALESCE(SUM(virtual_position_usdt) FILTER (WHERE status = 'OPEN'), 0) AS open_exposure,
+        COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_count,
+        COALESCE(SUM(virtual_pnl_usdt) FILTER (WHERE status = 'CLOSED'), 0) AS closed_pnl
+    FROM paper_signal_trades
+    ''')
+    open_count, open_exposure, closed_count, closed_pnl = cur.fetchone()
+
+    text = (
+        'Paper account\n\n'
+        f'Auto open: {"ON" if auto_open else "OFF"}\n'
+        f'Virtual balance: {fmt_money(balance)}\n'
+        f'Max trade size: {fmt_money(trade_size)}\n'
+        f'Effective next size: {fmt_money(effective_size)}\n'
+        f'Max open trades: {max_open}\n'
+        f'Max position pct: {max_position_pct:.2f}%\n'
+        f'Open trades: {open_count or 0}\n'
+        f'Open exposure: {fmt_money(open_exposure)}\n'
+        f'Closed trades: {closed_count or 0}\n'
+        f'Closed virtual PnL: {fmt_money(closed_pnl)}\n'
+        f'Updated: {updated_at}'
+    )
+    await update.message.reply_text(text)
+
+
+async def paper_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    ensure_paper_schema(cur)
+    amount = parse_float_arg(context)
+    if amount is None:
+        await paper_account(update, context)
+        return
+    if amount < 0:
+        await update.message.reply_text('Balance must be >= 0.')
+        return
+    cur.execute('''
+    INSERT INTO paper_account(account_key, balance_usdt, updated_at)
+    VALUES ('default', %s, %s)
+    ON CONFLICT(account_key) DO UPDATE SET
+        balance_usdt = EXCLUDED.balance_usdt,
+        updated_at = EXCLUDED.updated_at
+    ''', (amount, utcnow()))
+    await update.message.reply_text(f'Paper virtual balance set to {fmt_money(amount)}.')
+
+
+async def paper_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    ensure_paper_schema(cur)
+    amount = parse_float_arg(context)
+    if amount is None:
+        current = paper_setting(cur, 'trade_size_usdt', str(PAPER_TRADE_SIZE_USDT))
+        await update.message.reply_text(f'Current max paper trade size: {fmt_money(current)}')
+        return
+    if amount <= 0:
+        await update.message.reply_text('Trade size must be > 0.')
+        return
+    set_paper_setting(cur, 'trade_size_usdt', amount)
+    await update.message.reply_text(f'Max paper trade size set to {fmt_money(amount)}.')
+
+
+async def paper_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    ensure_paper_schema(cur)
+    if not context.args:
+        auto_open = paper_bool(cur, 'auto_open', PAPER_AUTO_OPEN)
+        await update.message.reply_text(f'Paper auto open is {"ON" if auto_open else "OFF"}. Use /paper_auto on or /paper_auto off.')
+        return
+    value = context.args[0].lower()
+    if value not in ('on', 'off', 'true', 'false', '1', '0', 'yes', 'no'):
+        await update.message.reply_text('Use /paper_auto on or /paper_auto off.')
+        return
+    enabled = value in ('on', 'true', '1', 'yes')
+    set_paper_setting(cur, 'auto_open', 'true' if enabled else 'false')
+    await update.message.reply_text(f'Paper auto open set to {"ON" if enabled else "OFF"}.')
+
+
+async def paper_limits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    ensure_paper_schema(cur)
+    numbers = []
+    for arg in context.args:
+        try:
+            numbers.append(float(arg.replace('%', '').replace(',', '')))
+        except ValueError:
+            continue
+
+    if not numbers:
+        max_open = paper_setting(cur, 'max_open_trades', str(PAPER_MAX_OPEN_TRADES))
+        max_pct = paper_setting(cur, 'max_position_pct', str(PAPER_MAX_POSITION_PCT))
+        await update.message.reply_text(
+            f'Current paper limits: max_open={max_open}, max_position_pct={float(max_pct):.2f}%.\n'
+            'Use /paper_limits 10 10 to set max open trades and max position percent.'
+        )
+        return
+
+    max_open = int(numbers[0])
+    if max_open < 0:
+        await update.message.reply_text('max_open must be >= 0.')
+        return
+    set_paper_setting(cur, 'max_open_trades', max_open)
+
+    message = f'Max open paper trades set to {max_open}.'
+    if len(numbers) >= 2:
+        max_pct = numbers[1]
+        if max_pct <= 0:
+            await update.message.reply_text('max_position_pct must be > 0.')
+            return
+        set_paper_setting(cur, 'max_position_pct', max_pct)
+        message += f' Max position pct set to {max_pct:.2f}%.'
+
+    await update.message.reply_text(message)
+
+
+async def paper_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur = conn.cursor()
+    ensure_paper_schema(cur)
+    days = int(parse_float_arg(context) or 30)
+    days = max(1, min(365, days))
+
+    cur.execute('''
+    SELECT
+        COUNT(*) AS closed,
+        COUNT(*) FILTER (WHERE pnl_pct > 0) AS wins,
+        COUNT(*) FILTER (WHERE pnl_pct < 0) AS losses,
+        COUNT(*) FILTER (WHERE pnl_pct = 0) AS flat,
+        AVG(pnl_pct) AS avg_pnl,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pnl_pct) AS median_pnl,
+        MIN(pnl_pct) AS worst_pnl,
+        MAX(pnl_pct) AS best_pnl,
+        COALESCE(SUM(virtual_pnl_usdt), 0) AS virtual_pnl
+    FROM paper_signal_trades
+    WHERE status = 'CLOSED'
+      AND closed_at >= NOW() - (%s || ' days')::interval
+    ''', (days,))
+    closed, wins, losses, flat, avg_pnl, median_pnl, worst_pnl, best_pnl, virtual_pnl = cur.fetchone()
+    winrate = (wins / closed * 100.0) if closed else 0
+
+    lines = [
+        f'Paper stats {days}d',
+        '',
+        f'Closed calls: {closed or 0}',
+        f'Wins: {wins or 0}',
+        f'Losses: {losses or 0}',
+        f'Flat: {flat or 0}',
+        f'Winrate: {winrate:.1f}%',
+        f'Avg pnl: {fmt_pct(avg_pnl)}',
+        f'Median pnl: {fmt_pct(median_pnl)}',
+        f'Best pnl: {fmt_pct(best_pnl)}',
+        f'Worst pnl: {fmt_pct(worst_pnl)}',
+        f'Virtual PnL: {fmt_money(virtual_pnl)}',
+    ]
+
+    cur.execute('''
+    SELECT UPPER(COALESCE(side, 'UNKNOWN')) AS side,
+           COUNT(*) AS closed,
+           COUNT(*) FILTER (WHERE pnl_pct > 0) AS wins,
+           AVG(pnl_pct) AS avg_pnl,
+           COALESCE(SUM(virtual_pnl_usdt), 0) AS virtual_pnl
+    FROM paper_signal_trades
+    WHERE status = 'CLOSED'
+      AND closed_at >= NOW() - (%s || ' days')::interval
+    GROUP BY UPPER(COALESCE(side, 'UNKNOWN'))
+    ORDER BY closed DESC, side
+    ''', (days,))
+    side_rows = cur.fetchall()
+    if side_rows:
+        lines.extend(['', 'By side:'])
+        for side, side_closed, side_wins, side_avg, side_virtual in side_rows:
+            side_winrate = (side_wins / side_closed * 100.0) if side_closed else 0
+            lines.append(f'{side}: n={side_closed} win={side_winrate:.1f}% avg={fmt_pct(side_avg)} pnl={fmt_money(side_virtual)}')
+
+    cur.execute('''
+    SELECT close_reason, COUNT(*) AS n
+    FROM paper_signal_trades
+    WHERE status = 'CLOSED'
+      AND closed_at >= NOW() - (%s || ' days')::interval
+    GROUP BY close_reason
+    ORDER BY n DESC, close_reason
+    ''', (days,))
+    reason_rows = cur.fetchall()
+    if reason_rows:
+        lines.extend(['', 'Close reasons:'])
+        for close_reason, count in reason_rows:
+            lines.append(f'{close_reason or "n/a"}: {count}')
+
+    await reply_text(update, '\n'.join(lines))
 
 
 async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -786,6 +1114,12 @@ app.add_handler(CommandHandler('calls', calls))
 app.add_handler(CommandHandler('long', long_calls))
 app.add_handler(CommandHandler('short', short_calls))
 app.add_handler(CommandHandler('paper', paper))
+app.add_handler(CommandHandler('paper_account', paper_account))
+app.add_handler(CommandHandler('paper_balance', paper_balance))
+app.add_handler(CommandHandler('paper_size', paper_size))
+app.add_handler(CommandHandler('paper_limits', paper_limits))
+app.add_handler(CommandHandler('paper_auto', paper_auto))
+app.add_handler(CommandHandler('paper_stats', paper_stats))
 app.add_handler(CommandHandler('sweep', sweep))
 app.add_handler(CommandHandler('backup', backup))
 app.add_handler(CommandHandler('pg_dump', pg_dump_backup))

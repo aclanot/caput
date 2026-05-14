@@ -15,6 +15,9 @@ INTERVAL_SECONDS = float(os.getenv('SIGNAL_BROADCASTER_INTERVAL_SECONDS', '10'))
 MAX_SIGNAL_AGE_MINUTES = int(os.getenv('SIGNAL_BROADCASTER_MAX_SIGNAL_AGE_MINUTES', '60'))
 PAPER_START_BALANCE_USDT = float(os.getenv('PAPER_START_BALANCE_USDT', '1000'))
 PAPER_TRADE_SIZE_USDT = float(os.getenv('PAPER_TRADE_SIZE_USDT', '100'))
+PAPER_AUTO_OPEN = os.getenv('PAPER_AUTO_OPEN', 'true').lower() in ('1', 'true', 'yes', 'on')
+PAPER_MAX_OPEN_TRADES = int(os.getenv('PAPER_MAX_OPEN_TRADES', '10'))
+PAPER_MAX_POSITION_PCT = float(os.getenv('PAPER_MAX_POSITION_PCT', '10'))
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -125,6 +128,65 @@ def ensure_schema():
     ON CONFLICT(account_key) DO NOTHING
     ''', (PAPER_START_BALANCE_USDT, utcnow()))
 
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS paper_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT,
+        updated_at TIMESTAMP
+    )
+    ''')
+    cur.executemany('''
+    INSERT INTO paper_settings(setting_key, setting_value, updated_at)
+    VALUES (%s, %s, %s)
+    ON CONFLICT(setting_key) DO NOTHING
+    ''', [
+        ('auto_open', 'true' if PAPER_AUTO_OPEN else 'false', utcnow()),
+        ('trade_size_usdt', str(PAPER_TRADE_SIZE_USDT), utcnow()),
+        ('max_open_trades', str(PAPER_MAX_OPEN_TRADES), utcnow()),
+        ('max_position_pct', str(PAPER_MAX_POSITION_PCT), utcnow()),
+    ])
+
+
+def paper_setting(key, default):
+    cur.execute('SELECT setting_value FROM paper_settings WHERE setting_key = %s', (key,))
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+def paper_setting_float(key, default):
+    try:
+        return float(paper_setting(key, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def paper_setting_int(key, default):
+    try:
+        return int(float(paper_setting(key, str(default))))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def paper_auto_open_enabled():
+    return str(paper_setting('auto_open', 'true' if PAPER_AUTO_OPEN else 'false')).lower() in ('1', 'true', 'yes', 'on')
+
+
+def configured_trade_size():
+    return max(0.0, paper_setting_float('trade_size_usdt', PAPER_TRADE_SIZE_USDT))
+
+
+def max_open_trades():
+    return max(0, paper_setting_int('max_open_trades', PAPER_MAX_OPEN_TRADES))
+
+
+def effective_trade_size(balance=None):
+    balance = account_balance() if balance is None else float(balance)
+    size = configured_trade_size()
+    max_pct = paper_setting_float('max_position_pct', PAPER_MAX_POSITION_PCT)
+    if max_pct > 0:
+        size = min(size, max(0.0, balance * max_pct / 100.0))
+    return max(0.0, size)
+
 
 def account_balance():
     cur.execute("SELECT balance_usdt FROM paper_account WHERE account_key = 'default'")
@@ -141,13 +203,14 @@ def account_balance():
 
 def fill_missing_virtual_open_fields():
     balance = account_balance()
+    position_size = effective_trade_size(balance)
     cur.execute('''
     UPDATE paper_signal_trades
     SET virtual_position_usdt = COALESCE(virtual_position_usdt, %s),
         virtual_balance_at_open = COALESCE(virtual_balance_at_open, %s)
     WHERE status = 'OPEN'
       AND (virtual_position_usdt IS NULL OR virtual_balance_at_open IS NULL)
-    ''', (PAPER_TRADE_SIZE_USDT, balance))
+    ''', (position_size, balance))
 
 
 def update_account_balance(delta_usdt):
@@ -159,6 +222,49 @@ def update_account_balance(delta_usdt):
     WHERE account_key = 'default'
     ''', (new_balance, utcnow()))
     return new_balance
+
+
+def open_missing_paper_trades():
+    if not paper_auto_open_enabled():
+        return 0
+
+    cur.execute("SELECT COUNT(*) FROM paper_signal_trades WHERE status = 'OPEN'")
+    open_count = cur.fetchone()[0]
+    slots = max_open_trades() - int(open_count or 0)
+    if slots <= 0:
+        return 0
+
+    balance = account_balance()
+    position_size = effective_trade_size(balance)
+    if position_size <= 0:
+        return 0
+
+    cur.execute('''
+    INSERT INTO paper_signal_trades(
+        signal_id, token_id, mode, side, status, confidence_pct,
+        entry_price, take_profit_price, stop_loss_price, max_leverage, opened_at,
+        liquidation_price, reward_pct, risk_pct, reward_risk,
+        virtual_position_usdt, virtual_balance_at_open
+    )
+    SELECT
+        ls.id, ls.token_id, ls.mode, ls.side, 'OPEN', ls.confidence_pct,
+        ls.current_price, ls.take_profit_price, ls.stop_loss_price, ls.max_leverage, %s,
+        ls.liquidation_price, ls.reward_pct, ls.risk_pct, ls.reward_risk,
+        %s, %s
+    FROM live_signals ls
+    LEFT JOIN paper_signal_trades pst ON pst.signal_id = ls.id
+    WHERE pst.id IS NULL
+      AND COALESCE(ls.signal_status, 'OPEN') <> 'CANCELLED'
+      AND COALESCE(ls.reason, '') NOT LIKE '%%CANCELLED_QUALITY_GATE%%'
+      AND ls.created_at >= NOW() - (%s || ' minutes')::interval
+    ORDER BY ls.confidence_pct DESC NULLS LAST,
+             ls.historical_avg_pnl DESC NULLS LAST,
+             ls.created_at ASC,
+             ls.id ASC
+    LIMIT %s
+    ON CONFLICT(signal_id) DO NOTHING
+    ''', (utcnow(), position_size, balance, MAX_SIGNAL_AGE_MINUTES, slots))
+    return cur.rowcount or 0
 
 
 def tg_send(text):
@@ -214,8 +320,9 @@ def signal_message(row):
     token_url = f'https://catapult.trade/ru/turbo/tokens/{token_id}'
     setup_label = 'Drawdown' if side == 'LONG' else 'Reversal from peak'
 
+    title = 'PAPER SIGNAL OPENED' if virtual_position_usdt is not None else 'SIGNAL FOUND (NO PAPER OPEN)'
     return (
-        'PAPER SIGNAL OPENED\n\n'
+        f'{title}\n\n'
         f'Token: {token_url}\n'
         f'Type: {side}\n'
         f'Mode: {mode}\n'
@@ -249,6 +356,9 @@ def signal_message(row):
 
 
 def broadcast_new_signals():
+    opened = open_missing_paper_trades()
+    if opened:
+        print(f'opened paper trades: {opened}', flush=True)
     fill_missing_virtual_open_fields()
     cur.execute('''
     SELECT
@@ -332,7 +442,7 @@ def update_open_paper_trades():
             continue
 
         leveraged_pnl_pct = pnl_pct * (max_leverage or 1.0)
-        position_usdt = float(position_usdt or PAPER_TRADE_SIZE_USDT)
+        position_usdt = float(position_usdt or effective_trade_size())
         virtual_pnl_usdt = position_usdt * leveraged_pnl_pct / 100.0
         balance_after = update_account_balance(virtual_pnl_usdt)
 
@@ -429,7 +539,8 @@ def main():
     print('signal broadcaster started', flush=True)
     print(
         f'chat_id={SIGNAL_CHAT_ID} interval={INTERVAL_SECONDS}s '
-        f'paper_start={PAPER_START_BALANCE_USDT} trade_size={PAPER_TRADE_SIZE_USDT}',
+        f'paper_start={PAPER_START_BALANCE_USDT} trade_size={configured_trade_size()} '
+        f'auto_open={paper_auto_open_enabled()} max_open={max_open_trades()}',
         flush=True,
     )
     while True:

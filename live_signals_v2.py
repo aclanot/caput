@@ -18,20 +18,22 @@ MIN_MEDIAN_PNL = float(os.getenv('LIVE_SIGNALS_MIN_MEDIAN_PNL', '5'))
 MAX_WORST_PNL = float(os.getenv('LIVE_SIGNALS_MAX_WORST_PNL', '-70'))
 MAX_STOP_DISTANCE_PCT = float(os.getenv('LIVE_SIGNALS_MAX_STOP_DISTANCE_PCT', '120'))
 MIN_REWARD_RISK = float(os.getenv('LIVE_SIGNALS_MIN_REWARD_RISK', '0.35'))
-SHORT_MIN_CURRENT_RETURN_PCT = float(os.getenv('LIVE_SIGNALS_SHORT_MIN_CURRENT_RETURN_PCT', '10'))
+SHORT_MIN_CURRENT_RETURN_PCT = float(os.getenv('LIVE_SIGNALS_SHORT_MIN_CURRENT_RETURN_PCT', '5'))
 LONG_MIN_TRADES = int(os.getenv('LIVE_SIGNALS_LONG_MIN_TRADES', '50'))
 LONG_MIN_WINRATE = float(os.getenv('LIVE_SIGNALS_LONG_MIN_WINRATE', '0.55'))
 LONG_MIN_EXPECTANCY = float(os.getenv('LIVE_SIGNALS_LONG_MIN_EXPECTANCY', '5'))
 LONG_MIN_CONFIDENCE = int(os.getenv('LIVE_SIGNALS_LONG_MIN_CONFIDENCE', str(MIN_CONFIDENCE)))
-MIN_PUMP = float(os.getenv('LIVE_SIGNALS_MIN_PUMP_FOR_REVERSAL_PCT', '50'))
-MIN_REVERSAL = float(os.getenv('LIVE_SIGNALS_MIN_REVERSAL_FROM_PEAK_PCT', '12'))
+MIN_PUMP = float(os.getenv('LIVE_SIGNALS_MIN_PUMP_FOR_REVERSAL_PCT', '40'))
+MIN_REVERSAL = float(os.getenv('LIVE_SIGNALS_MIN_REVERSAL_FROM_PEAK_PCT', '10'))
 SHORT_TP_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_TP_PCT', '30'))
 SHORT_SL_PCT = float(os.getenv('LIVE_SIGNAL_SHORT_SL_PCT', '35'))
 LONG_TP_PCT = float(os.getenv('LIVE_SIGNAL_LONG_TP_PCT', '20'))
 LONG_SL_PCT = float(os.getenv('LIVE_SIGNAL_LONG_SL_PCT', '25'))
+CAP_EXECUTION_STOP = os.getenv('LIVE_SIGNALS_CAP_EXECUTION_STOP', 'true').lower() in ('1', 'true', 'yes', 'on')
 MAX_STRATEGIES_PER_TOKEN_SIDE = int(os.getenv('LIVE_SIGNALS_MAX_STRATEGIES_PER_TOKEN_SIDE', '5'))
 DEBUG_LOG_LIMIT_PER_STATUS = int(os.getenv('LIVE_SIGNALS_DEBUG_LOG_LIMIT_PER_STATUS', '5'))
 SKIP_SCHEMA_ENSURE = os.getenv('LIVE_SIGNALS_SKIP_SCHEMA_ENSURE', 'false').lower() in ('1', 'true', 'yes', 'on')
+OPEN_PAPER_IN_GENERATOR = os.getenv('LIVE_SIGNALS_OPEN_PAPER_IN_GENERATOR', 'false').lower() in ('1', 'true', 'yes', 'on')
 
 if not DATABASE_URL:
     raise SystemExit('DATABASE_URL is missing')
@@ -232,6 +234,7 @@ def prices_for_signal(side, current_price, current_return_pct=None, strategy_tp=
     if side == 'SHORT':
         tp = None
         sl = None
+        fallback_sl = current_price * (1.0 + SHORT_SL_PCT / 100.0)
         if current_return_pct is not None and current_return_pct > -99:
             initial_price = current_price / (1.0 + current_return_pct / 100.0)
             if strategy_tp and 0 < strategy_tp < 1:
@@ -241,12 +244,16 @@ def prices_for_signal(side, current_price, current_return_pct=None, strategy_tp=
         if tp is None or tp >= current_price:
             tp = current_price * (1.0 - SHORT_TP_PCT / 100.0)
         if sl is None or sl <= current_price:
-            sl = current_price * (1.0 + SHORT_SL_PCT / 100.0)
+            sl = fallback_sl
+        elif CAP_EXECUTION_STOP:
+            sl = min(sl, fallback_sl)
     else:
         tp_mult = strategy_tp if strategy_tp and strategy_tp > 1 else 1.0 + LONG_TP_PCT / 100.0
         sl_mult = strategy_sl if strategy_sl and 0 < strategy_sl < 1 else 1.0 - LONG_SL_PCT / 100.0
         tp = current_price * tp_mult
         sl = current_price * sl_mult
+        if CAP_EXECUTION_STOP:
+            sl = max(sl, current_price * (1.0 - LONG_SL_PCT / 100.0))
     return entry_low, entry_high, tp, sl
 
 
@@ -534,17 +541,18 @@ for row in rows:
     ))
     signal_id = cur.fetchone()[0]
 
-    cur.execute('''
-    INSERT INTO paper_signal_trades(
-        signal_id, token_id, mode, side, status, confidence_pct,
-        entry_price, take_profit_price, stop_loss_price, max_leverage, opened_at,
-        liquidation_price, reward_pct, risk_pct, reward_risk
-    ) VALUES (%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    ON CONFLICT(signal_id) DO NOTHING
-    ''', (
-        signal_id, token_id, mode, side, conf, current_price, tp, sl, lev, utcnow(),
-        liquidation_price, reward_pct, risk_pct, reward_risk,
-    ))
+    if OPEN_PAPER_IN_GENERATOR:
+        cur.execute('''
+        INSERT INTO paper_signal_trades(
+            signal_id, token_id, mode, side, status, confidence_pct,
+            entry_price, take_profit_price, stop_loss_price, max_leverage, opened_at,
+            liquidation_price, reward_pct, risk_pct, reward_risk
+        ) VALUES (%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(signal_id) DO NOTHING
+        ''', (
+            signal_id, token_id, mode, side, conf, current_price, tp, sl, lev, utcnow(),
+            liquidation_price, reward_pct, risk_pct, reward_risk,
+        ))
     created += 1
 
 flush_debug_examples()
