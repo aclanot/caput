@@ -17,12 +17,16 @@ def utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def run_script(script):
+def run_script(script, extra_env=None):
     print(f'\n{utcnow()} UTC | START | {script}', flush=True)
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.run(
         [sys.executable, script],
         text=True,
         capture_output=True,
+        env=env,
     )
 
     if proc.stdout:
@@ -43,6 +47,7 @@ def main():
     print(f'interval={INTERVAL_SECONDS}s run_features={RUN_FEATURES} run_signals={RUN_SIGNALS}', flush=True)
     print('Keep official_api_collector.py running in another terminal/service.', flush=True)
     print('Keep signal_broadcaster.py running in another terminal/service for Telegram + paper trade tracking.', flush=True)
+    signals_schema_ready = False
 
     while True:
         cycle_started = utcnow()
@@ -54,7 +59,11 @@ def main():
             run_script('live_features.py')
 
         if RUN_SIGNALS:
-            run_script('live_signals.py')
+            ok = run_script(
+                'live_signals_v2.py',
+                {'LIVE_SIGNALS_SKIP_SCHEMA_ENSURE': 'true'} if signals_schema_ready else None,
+            )
+            signals_schema_ready = signals_schema_ready or ok
 
         print(f'{utcnow()} UTC | LIVE CYCLE DONE | sleeping {INTERVAL_SECONDS}s', flush=True)
         time.sleep(INTERVAL_SECONDS)
